@@ -4,6 +4,28 @@ Loads and owns the single active llama.cpp model instance.
 Only one model is loaded at a time (roadmap: General/Coding modes share one
 VRAM slot) - this module is the one place that owns the Llama instance so
 nothing else needs to reason about load/unload lifecycle yet.
+
+Phase 3.0: two modes, "general" and "coding", each with its own model
+path. Switching modes means unloading whatever's loaded and loading the
+other mode's model - ensure_mode() is the entry point for that, and skips
+the reload when the requested mode is already active, since a full GGUF
+load is expensive (real wall-clock time) and most calls stay in one mode.
+A mode switch is therefore a slow, synchronous operation that happens
+inline on whichever request first asks for the new mode - not instant.
+
+No dedicated coding model has been picked/validated yet (see
+docs/CODING_AGENT_ROADMAP.md Phase 3.0) - BARBAI_CODING_MODEL_PATH falls
+back to BARBAI_MODEL_PATH/DEFAULT_MODEL_PATH until one is, so the
+switching mechanism itself is usable and testable today with Qwen3.5-9B
+standing in for both modes.
+
+Gotcha: _model is process-wide, shared by every endpoint. Only
+/agent/chat is mode-aware right now (see api/agent.py) - once it switches
+to "coding", every OTHER endpoint (native /chat, the OpenAI/Anthropic
+passthroughs) is now also being served by the coding model until
+something switches back, since they all call get_model() and just get
+whatever's currently loaded. That's the intended behavior for a
+single-model-in-VRAM design, not a bug - just don't be surprised by it.
 """
 
 from __future__ import annotations
@@ -15,7 +37,17 @@ from llama_cpp import Llama
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent.parent.parent / "models" / "Qwen_Qwen3.5-9B-Q4_K_M.gguf"
 
+MODES = ("general", "coding")
+
 _model: Llama | None = None
+_current_mode: str | None = None
+
+def _model_path_for_mode(mode: str) -> Path:
+    if mode == "coding":
+        raw = os.environ.get("BARBAI_CODING_MODEL_PATH") or os.environ.get("BARBAI_MODEL_PATH")
+    else:
+        raw = os.environ.get("BARBAI_MODEL_PATH")
+    return Path(raw) if raw else DEFAULT_MODEL_PATH
 
 def get_model() -> Llama:
     model = _model
@@ -23,23 +55,43 @@ def get_model() -> Llama:
         raise RuntimeError("model not loaded - see docs/SETUP.md")
     return model
 
-def load_model(model_path: Path | str | None = None, n_gpu_layers: int = -1, n_ctx: int = 4096) -> Llama:
-    global _model
-    path = Path(model_path) if model_path else Path(os.environ.get("BARBAI_MODEL_PATH", DEFAULT_MODEL_PATH))
+def current_mode() -> str | None:
+    """The mode of the currently loaded model, or None if nothing's loaded."""
+    return _current_mode
+
+def load_model(
+    model_path: Path | str | None = None, n_gpu_layers: int = -1, n_ctx: int = 4096, mode: str = "general"
+) -> Llama:
+    global _model, _current_mode
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
+    path = Path(model_path) if model_path else _model_path_for_mode(mode)
     if not path.exists():
         raise FileNotFoundError(f"model not found at {path} - see docs/SETUP.md")
     model = Llama(model_path=str(path), n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=False)
     _model = model
+    _current_mode = mode
     return model
 
 def unload_model() -> None:
-    global _model
+    global _model, _current_mode
     _model = None
+    _current_mode = None
 
+def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int = 4096) -> Llama:
+    """Return the model for `mode`, loading or switching only if needed.
+
+    A call for the mode that's already active reuses the loaded model
+    instead of paying for a full GGUF reload.
+    """
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
+    if _model is not None and _current_mode == mode:
+        return _model
+    return load_model(n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, mode=mode)
 
 THINKING_MODES = ("fast", "thinking", "extended")
 _EXTENDED_MIN_MAX_TOKENS = 1500
-
 
 def _resolve_chat_handler(llm: Llama):
     """Get the callable llama-cpp-python actually uses to run a chat
@@ -55,7 +107,6 @@ def _resolve_chat_handler(llm: Llama):
     if handler is None:
         raise RuntimeError(f"no chat handler resolved for chat_format={llm.chat_format!r}")
     return handler
-
 
 def create_chat_completion(llm: Llama, messages: list[dict], *, thinking_mode: str = "thinking", **kwargs):
     """Chat completion with control over Qwen3.5's reasoning pass.

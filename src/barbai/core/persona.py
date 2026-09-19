@@ -11,6 +11,13 @@ it into an unproductive reasoning loop (repeatedly re-litigating the same
 constraint instead of ever answering) - a known failure mode for mid-size
 reasoning models given conflicting/nuanced constraints. Straightforward,
 unconditional instructions don't trigger this.
+
+Phase 3.0 adds a second, Coding-mode identity (CODING_SYSTEM_PROMPT) -
+same BarbAI persona underneath, layered with the product differentiator
+docs/BARBAI_ROADMAP.md names for Coding mode: explain the fix afterward,
+don't just dump a diff. build_system_prompt's `mode` param picks which
+base identity to use; the thinking nudge, remembered facts, and any
+custom prompt layer on top exactly the same way regardless of mode.
 """
 
 from barbai.core import global_memory
@@ -23,17 +30,26 @@ DEFAULT_SYSTEM_PROMPT = (
     "briefly that you run on a local open-weight model, then move on."
 )
 
+CODING_SYSTEM_PROMPT = (
+    "You are BarbAI, a local-first AI assistant that runs entirely on the "
+    "user's own hardware, working right now in Coding mode. Speak in "
+    "first person as BarbAI, not as any other AI brand. You're not a "
+    "snippet generator: read the relevant code before changing it, make "
+    "the precise edit, verify it (run the tests/build when you can), and "
+    "explain what you changed and why afterward - not just the diff. If "
+    "asked what model or technology powers you under the hood, mention "
+    "briefly that you run on a local open-weight model, then move on."
+)
 
 EXTENDED_THINKING_NUDGE = (
     "For this response, think through the problem thoroughly and from "
     "multiple angles before answering."
 )
 
-
-def build_system_prompt(custom: str | None, thinking_mode: str = "thinking") -> str:
-    """Combine the base identity, the thinking-mode nudge, remembered
-    global-memory facts, and a caller-supplied system prompt, in that
-    order.
+def build_system_prompt(custom: str | None, thinking_mode: str = "thinking", mode: str = "general") -> str:
+    """Combine the base identity (general or coding), the thinking-mode
+    nudge, remembered global-memory facts, and a caller-supplied system
+    prompt, in that order.
 
     The base identity always applies. The extended-thinking nudge (only
     added when thinking_mode == "extended") comes next since it shapes how
@@ -47,7 +63,11 @@ def build_system_prompt(custom: str | None, thinking_mode: str = "thinking") -> 
     forced brevity) in the custom prompt's favor while still keeping the
     BarbAI identity.
     """
-    parts = [DEFAULT_SYSTEM_PROMPT]
+    if mode not in ("general", "coding"):
+        raise ValueError(f"unknown mode {mode!r}, expected 'general' or 'coding'")
+
+    base = CODING_SYSTEM_PROMPT if mode == "coding" else DEFAULT_SYSTEM_PROMPT
+    parts = [base]
     if thinking_mode == "extended":
         parts.append(EXTENDED_THINKING_NUDGE)
     memory_block = global_memory.render_for_prompt()

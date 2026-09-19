@@ -7,7 +7,14 @@ Anthropic compat, where the caller runs its own tools), this endpoint
 executes tools itself and only returns once the model has a final answer
 or a gated tool call (write_file) needs human approval.
 
-Three ways to call it:
+Phase 3.0: this is the one mode-aware endpoint. `mode` ("general" or
+"coding", default "general") picks the model and persona via
+model_runtime.ensure_mode()/core.persona. A mode switch is a real,
+synchronous GGUF load that happens inline on this request if the
+requested mode isn't already active - see model_runtime's module
+docstring for the "this affects every other endpoint too" gotcha.
+
+Four ways to call it:
   - Start a fresh, one-off conversation: send `messages` (role/content
     pairs), no `session_id`. The persona system prompt is built and
     prepended automatically. Nothing is remembered afterward.
@@ -16,7 +23,12 @@ Three ways to call it:
     prior history (bounded by a rolling window - see core.memory),
     prepends it, and appends the new turn(s) plus its reply back to the
     session log once it has a final answer. Reuse the same `session_id`
-    next time to continue it.
+    next time to continue it. For Coding-mode work, derive session_id
+    from the project/working directory (e.g. a hash of its path) rather
+    than a random id - that's what gives each project its own memory,
+    the same way Claude Code scopes history per project, without needing
+    any separate storage mechanism (see docs/CODING_AGENT_ROADMAP.md
+    Phase 3.0).
   - Resume a paused one: send back the `conversation` this endpoint
     returned from a prior `"status": "pending_approval"` response,
     unchanged, plus `approvals` mapping each pending tool_call_id to
@@ -50,12 +62,13 @@ class AgentChatRequest(BaseModel):
     system: str | None = None
     thinking: Literal["fast", "thinking", "extended"] = "thinking"
     session_id: str | None = None
+    mode: Literal["general", "coding"] = "general"
 
 @router.post("/agent/chat")
 def agent_chat(request: AgentChatRequest):
     try:
-        llm = model_runtime.get_model()
-    except RuntimeError as exc:
+        llm = model_runtime.ensure_mode(request.mode)
+    except (RuntimeError, FileNotFoundError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     new_messages: list[dict] = []
@@ -65,7 +78,7 @@ def agent_chat(request: AgentChatRequest):
         new_messages = [m.model_dump() for m in request.messages]
         history = memory.rolling_window(memory.load_session(request.session_id)) if request.session_id else []
         messages = [
-            {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
+            {"role": "system", "content": build_system_prompt(request.system, request.thinking, request.mode)}
         ] + history + new_messages
     else:
         raise HTTPException(

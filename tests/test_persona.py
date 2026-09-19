@@ -1,7 +1,7 @@
 import pytest
 
 from barbai.core.global_memory import add_fact
-from barbai.core.persona import DEFAULT_SYSTEM_PROMPT, EXTENDED_THINKING_NUDGE, build_system_prompt
+from barbai.core.persona import CODING_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT, EXTENDED_THINKING_NUDGE, build_system_prompt
 
 
 @pytest.fixture(autouse=True)
@@ -59,3 +59,18 @@ def test_disabled_global_memory_omits_facts(monkeypatch):
     monkeypatch.setenv("BARBAI_GLOBAL_MEMORY", "off")
     result = build_system_prompt(None, "thinking")
     assert result == DEFAULT_SYSTEM_PROMPT
+
+
+def test_general_mode_is_the_default():
+    assert build_system_prompt(None, "thinking") == DEFAULT_SYSTEM_PROMPT
+
+
+def test_coding_mode_uses_coding_prompt():
+    result = build_system_prompt(None, "thinking", mode="coding")
+    assert CODING_SYSTEM_PROMPT in result
+    assert DEFAULT_SYSTEM_PROMPT not in result
+
+
+def test_invalid_mode_raises():
+    with pytest.raises(ValueError):
+        build_system_prompt(None, "thinking", mode="bogus")
