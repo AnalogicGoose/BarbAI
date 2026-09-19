@@ -26,6 +26,15 @@ passthroughs) is now also being served by the coding model until
 something switches back, since they all call get_model() and just get
 whatever's currently loaded. That's the intended behavior for a
 single-model-in-VRAM design, not a bug - just don't be surprised by it.
+
+BARBAI_N_CTX overrides the context window (default 4096) - was hardcoded
+until a real need showed up: routing an external client like the Claude
+Code CLI through /v1/messages (see docs/SETUP.md's note on this) sends
+its own large system prompt and built-in tool definitions before any
+actual conversation happens, easily past 4096 tokens on its own. Raising
+this uses more VRAM for the KV cache - there's no automatic check that a
+larger value still fits the current tier, the caller is trusted to know
+what they asked for.
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from pathlib import Path
 from llama_cpp import Llama
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent.parent.parent / "models" / "Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+DEFAULT_N_CTX = 4096
 
 MODES = ("general", "coding")
 
@@ -49,6 +59,17 @@ def _model_path_for_mode(mode: str) -> Path:
         raw = os.environ.get("BARBAI_MODEL_PATH")
     return Path(raw) if raw else DEFAULT_MODEL_PATH
 
+def _resolve_n_ctx(n_ctx: int | None) -> int:
+    if n_ctx is not None:
+        return n_ctx
+    raw = os.environ.get("BARBAI_N_CTX")
+    if not raw:
+        return DEFAULT_N_CTX
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"BARBAI_N_CTX must be an integer, got {raw!r}") from None
+
 def get_model() -> Llama:
     model = _model
     if model is None:
@@ -60,7 +81,7 @@ def current_mode() -> str | None:
     return _current_mode
 
 def load_model(
-    model_path: Path | str | None = None, n_gpu_layers: int = -1, n_ctx: int = 4096, mode: str = "general"
+    model_path: Path | str | None = None, n_gpu_layers: int = -1, n_ctx: int | None = None, mode: str = "general"
 ) -> Llama:
     global _model, _current_mode
     if mode not in MODES:
@@ -68,7 +89,7 @@ def load_model(
     path = Path(model_path) if model_path else _model_path_for_mode(mode)
     if not path.exists():
         raise FileNotFoundError(f"model not found at {path} - see docs/SETUP.md")
-    model = Llama(model_path=str(path), n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=False)
+    model = Llama(model_path=str(path), n_gpu_layers=n_gpu_layers, n_ctx=_resolve_n_ctx(n_ctx), verbose=False)
     _model = model
     _current_mode = mode
     return model
@@ -78,7 +99,7 @@ def unload_model() -> None:
     _model = None
     _current_mode = None
 
-def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int = 4096) -> Llama:
+def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int | None = None) -> Llama:
     """Return the model for `mode`, loading or switching only if needed.
 
     A call for the mode that's already active reuses the loaded model

@@ -122,3 +122,24 @@ def test_ensure_mode_reloads_on_mode_switch(monkeypatch):
     result = model_runtime.ensure_mode("coding")
     assert result is new
     assert calls == ["coding"]
+
+
+def test_resolve_n_ctx_explicit_value_wins(monkeypatch):
+    monkeypatch.setenv("BARBAI_N_CTX", "8192")
+    assert model_runtime._resolve_n_ctx(2048) == 2048
+
+
+def test_resolve_n_ctx_env_var_used_when_not_explicit(monkeypatch):
+    monkeypatch.setenv("BARBAI_N_CTX", "16384")
+    assert model_runtime._resolve_n_ctx(None) == 16384
+
+
+def test_resolve_n_ctx_defaults_when_unset(monkeypatch):
+    monkeypatch.delenv("BARBAI_N_CTX", raising=False)
+    assert model_runtime._resolve_n_ctx(None) == model_runtime.DEFAULT_N_CTX
+
+
+def test_resolve_n_ctx_rejects_non_integer(monkeypatch):
+    monkeypatch.setenv("BARBAI_N_CTX", "not-a-number")
+    with pytest.raises(ValueError):
+        model_runtime._resolve_n_ctx(None)

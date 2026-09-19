@@ -86,3 +86,49 @@ laptops. On a Mac or an AMD GPU, `nvidia-smi` won't exist, so
 `hardware_tier: null` — inference itself still works fine (llama.cpp
 handles Metal/CPU regardless), you just don't get the automatic model-class
 recommendation. Extending detection to Metal/ROCm is unscoped for now.
+
+## 4. Pointing an external Anthropic-compatible client at BarbAI
+
+`POST /v1/messages` (`src/barbai/api/anthropic.py`) speaks the real
+Anthropic Messages wire format, so any client built against it — the
+Claude Code CLI included — can be redirected to talk to BarbAI instead,
+via two environment variables the CLI reads once at startup:
+
+```
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_AUTH_TOKEN=unused   # BarbAI doesn't check this, but the CLI wants something set
+claude
+```
+
+(`ANTHROPIC_BASE_URL` is a value the CLI reads once at process start —
+set it before launching, restarting an already-running session won't
+pick it up.)
+
+What actually happens: BarbAI's own persona is always injected as the
+system prompt (`core/persona.py`), layered underneath whatever system
+prompt the CLI sends — so it answers as **BarbAI**, on a completely
+different (and much smaller) model, not as Claude. It isn't a way to
+"continue" a Claude conversation; it's a fresh conversation with a
+different assistant, backed by this project's own docs/memory for
+orientation instead of the prior chat's context.
+
+**The real blocker, not a maybe:** the Claude Code CLI's own system
+prompt plus its full built-in tool-definition set is large enough that
+it's very likely already past BarbAI's default 4096-token context window
+before any actual conversation happens. Raise it with `BARBAI_N_CTX`
+(e.g. `export BARBAI_N_CTX=32768`, within what Qwen3.5's own native
+context supports) — but a larger context means a larger KV cache, which
+needs more VRAM on top of the model weights, and it adds up fast:
+measured live on this project's own 4070 (8GB), Qwen3.5-9B at the
+default 4096 leaves comfortable headroom, but `BARBAI_N_CTX=16384` alone
+drops free VRAM from ~7780MiB to **~1408MiB** — right at
+`core/hardware.py`'s `RESERVED_FLOOR_MB` safety floor. There's no
+automatic check that a given value still fits your card; watch
+`nvidia-smi` or `/health` after raising it, and expect to need a smaller
+model (the `fast`-tier picks, Qwen3.5-4B/2B - see
+`docs/BARBAI_ROADMAP.md` Phase 2.1) if you want real headroom at a large
+context on an 8GB-class card. Beyond context size, Qwen3.5-9B/4B's
+tool-calling reliability has only been verified against BarbAI's own
+small native tool set (Phase 2.2/3.1's testing) — not against the CLI's
+larger, more complex built-in tools, which is genuinely untested
+territory.

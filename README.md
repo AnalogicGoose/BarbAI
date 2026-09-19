@@ -170,6 +170,7 @@ Environment variables:
 |---|---|---|
 | `BARBAI_MODEL_PATH` | `models/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Path to the GGUF file to load for General mode |
 | `BARBAI_CODING_MODEL_PATH` | falls back to `BARBAI_MODEL_PATH` | Path to the GGUF file to load for Coding mode (`/agent/chat`'s `"mode": "coding"`) |
+| `BARBAI_N_CTX` | `4096` | Context window size. Raising this needs more VRAM for the KV cache — no automatic check that it still fits. See `docs/SETUP.md` section 4 for why an external client like the Claude Code CLI needs this raised |
 | `BARBAI_TOOLS_ROOTS` | current working directory | Comma-separated allowlist for the `read_file`/`write_file` tools — mix whole directories (everything inside readable/writable) and individual files (only that exact file readable, not writable as a new-file target) |
 | `BARBAI_SESSIONS_DIR` | `./sessions` | Where session-memory JSONL logs are written, one file per `session_id` |
 | `BARBAI_GLOBAL_MEMORY` | `on` | Set to `off` to disable the `remember` tool and stop injecting remembered facts into the system prompt |
