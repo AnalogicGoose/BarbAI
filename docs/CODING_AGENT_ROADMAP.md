@@ -61,10 +61,32 @@ this piece landing first.
   needs its own instruction: explain the fix afterward, don't just dump a
   diff (this is the actual product differentiator vs. "snippet
   generator" per the original roadmap's framing).
-- **Open design question:** how does switching modes interact with an
-  in-flight `session_id` or global memory — same store across both
-  modes, or scoped separately? Needs a decision before the API shape is
-  final, not before this phase starts.
+- **Resolved — memory/context scoping.** Checked against how Claude Code
+  and Codex actually do this: neither splits by a flat "chatbot vs.
+  coding agent" switch — Claude Code scopes history **per project**
+  (`~/.claude/projects/<repo-path>/`, a separate transcript for every
+  working directory), completely disconnected from claude.ai's own chat
+  memory, which is a different product and mechanism entirely.
+  - **Session memory (`core/memory.py`) splits by project, via
+    `session_id` convention, not new storage code.** `session_id` is
+    already just an opaque caller-supplied string — a Coding-mode client
+    derives it from the working directory (e.g. a hash of the project
+    path) instead of a random id, and General vs. Coding sessions are
+    already fully isolated with the mechanism that exists today. Two
+    small additions still worth making once Phase 3.0 lands: (1)
+    mode-scoped storage roots so the files are organized on disk
+    (`sessions/general/` vs `sessions/coding/<project>/`, not one flat
+    directory) rather than a functional requirement, and (2) a `mode`
+    field on the request so `/agent/chat` can enforce Coding-only tools
+    (`write_file`, later `run_command`/`patch_file`) never get offered
+    in General mode.
+  - **Global memory (`core/global_memory.py`) stays ONE shared store**
+    across both modes — decided explicitly, not defaulted. A remembered
+    fact is about the *user* ("prefers concise answers"), not the task,
+    so it's equally relevant whether you're chatting or coding. This is
+    the one place BarbAI's design deliberately diverges from the
+    Claude Code precedent (which shares nothing with claude.ai's memory)
+    — the divergence is intentional, not an oversight.
 
 ### Phase 3.1 — Expanded local tool suite
 `read_file`/`write_file` are whole-file only and capped at 100KB/1MB —
