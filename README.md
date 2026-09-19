@@ -16,13 +16,15 @@ Coding mode specifically lives in
 Phase 2.0 (core loop), most of Phase 2.2 (tool calling), and Phase 2.3
 (memory) are done — see the roadmap doc for the detailed breakdown. In
 short: model loading, hardware-tier detection, streaming, tool calling, a
-server-side agent loop with read/write file tools plus a `remember` tool
-(all gated behind a human approval step), opt-in per-conversation session
-memory, and an explicit-only global memory that persists across every
-conversation are all built and tested. Phase 2.1's other two target
-laptops (3050, 5070 Ti) still need real hardware to verify against.
-Coding mode is planned in sub-phases (see
-`docs/CODING_AGENT_ROADMAP.md`); the mode-switching mechanism itself
+server-side agent loop with five tools — `read_file` (whole-file or a
+line range), `write_file`, `remember`, `list_directory`, and `search`
+(the last two ungated, the first three gated behind a human approval
+step) — opt-in per-conversation session memory, and an explicit-only
+global memory that persists across every conversation are all built and
+tested. Phase 2.1's other two target laptops (3050, 5070 Ti) still need
+real hardware to verify against. Coding mode is planned in sub-phases
+(see `docs/CODING_AGENT_ROADMAP.md`, Phase 3.1 partly done — the
+read-only tool half); the mode-switching mechanism itself
 (`/agent/chat`'s `mode` field, a Coding-specific persona) is built and
 tested. No dedicated coding model — decided, not just unfinished: the
 obvious pick (Qwen2.5-Coder-7B) is the model this project already found
@@ -100,6 +102,13 @@ Easiest way to try any of them: start the server, then open
   (Linux/Windows, CUDA), Apple Silicon (macOS, Metal). Works CPU-only
   without one, just slower.
 - A GGUF model file (see below).
+- [`ripgrep`](https://github.com/BurntSushi/ripgrep) (the `rg` binary) —
+  required for the `search` tool. Not a Python dependency, so `uv sync`
+  won't install it: `sudo dnf install ripgrep` / `sudo apt install
+  ripgrep` / `brew install ripgrep`, or grab a static binary from the
+  [releases page](https://github.com/BurntSushi/ripgrep/releases) if you
+  don't have root. Everything else works fine without it — only `search`
+  itself fails, with a clear error, until it's installed.
 
 ## Setup
 

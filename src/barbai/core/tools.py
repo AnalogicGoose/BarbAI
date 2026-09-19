@@ -1,12 +1,12 @@
 """
 Built-in tools the agent runtime can execute server-side.
 
-Three tools so far: a read-only file read and a file write (roadmap
-Phase 2.2), both scoped to an allowlist, and `remember` (Phase 2.3 v1),
-which writes a single fact to BarbAI's global cross-conversation memory
-(core/global_memory.py) - see that module's docstring for the
-explicit-only design rationale. Hold off on shell tools until this is
-proven solid.
+Read-only tools (Phase 2.2's read_file, Phase 3.1's list_directory,
+search, and read_file's line-range mode) are ungated - routine reads
+don't need human approval, matching Mana's own model (see
+docs/BARBAI_ROADMAP.md section 3). write_file and remember mutate state
+and are gated: the agent loop (core/agent.py) pauses for human approval
+before running one of these, rather than executing it immediately.
 
 The allowlist (BARBAI_TOOLS_ROOTS, comma-separated) can mix two kinds of
 entries, matching how Claude Code/Codex-style tools scope file access:
@@ -15,17 +15,24 @@ entries, matching how Claude Code/Codex-style tools scope file access:
     (and can't be a write target for a *new* file, since a relative path
     can't target a file-root directly - see _resolve_path)
 Multiple directories can be attached at once (Codex-style multi-root).
+Every tool below reuses the same _resolve_path/_is_allowed boundary
+check - there's exactly one place that decides what's in scope.
 
-GATED_TOOLS marks tools that write/change state - the agent loop
-(core/agent.py) pauses for human approval before running one of these,
-rather than executing it immediately like a routine read. `remember` is
-gated for the same reason write_file is: a misphrased "remembered" fact
-would otherwise quietly shape every future conversation with no review.
+search shells out to ripgrep (`rg`) rather than reimplementing it -
+correct multiline/binary handling and .gitignore-awareness aren't worth
+rebuilding, and this project already leans on external binaries the same
+way for hardware detection (nvidia-smi). Always invoked as an argument
+list (never shell=True), with `--` before the user-supplied pattern, so
+neither the pattern nor a resolved path can be interpreted as a flag or
+reach a shell.
 """
 
 from __future__ import annotations
 
+import itertools
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 from barbai.core import global_memory
@@ -33,8 +40,15 @@ from barbai.core import global_memory
 MAX_FILE_BYTES = 100_000
 MAX_WRITE_BYTES = 1_000_000
 MAX_REMEMBER_CHARS = 500
+MAX_LIST_ENTRIES = 500
+MAX_SEARCH_RESULTS = 200
 
 GATED_TOOLS = {"write_file", "remember"}
+
+_NOISE_DIR_NAMES = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".pytest_cache", ".mypy_cache", "dist", "build", ".idea", ".codegraph",
+}
 
 class ToolExecutionError(RuntimeError):
     """
@@ -98,7 +112,7 @@ def _describe_roots(roots: list[Path]) -> str:
         parts.append(f"{root} ({kind})")
     return "; ".join(parts)
 
-def read_file(path: str) -> str:
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
     roots = _workspace_roots()
     candidate = _resolve_path(path, roots)
     if candidate is None:
@@ -109,14 +123,43 @@ def read_file(path: str) -> str:
     if not candidate.is_file():
         raise ToolExecutionError(f"not a file: {path!r}")
 
-    size = candidate.stat().st_size
-    if size > MAX_FILE_BYTES:
-        raise ToolExecutionError(f"file too large ({size} bytes, limit {MAX_FILE_BYTES})")
+    if start_line is None and end_line is None:
+        size = candidate.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise ToolExecutionError(
+                f"file too large ({size} bytes, limit {MAX_FILE_BYTES}) - retry with "
+                "start_line/end_line to read a slice instead of the whole file"
+            )
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise ToolExecutionError(f"{path!r} is not a text file") from None
 
+    start = start_line if start_line is not None else 1
+    if start < 1:
+        raise ToolExecutionError(f"start_line must be >= 1, got {start_line}")
+    if end_line is not None and end_line < start:
+        raise ToolExecutionError(f"end_line ({end_line}) is before start_line ({start})")
+
+    # Streams rather than reading the whole file up front - keeps memory
+    # bounded even when the file itself is far past MAX_FILE_BYTES, which
+    # is the whole point of a range read.
     try:
-        return candidate.read_text(encoding="utf-8")
+        with candidate.open("r", encoding="utf-8") as f:
+            selected = list(itertools.islice(f, start - 1, end_line))
     except UnicodeDecodeError:
         raise ToolExecutionError(f"{path!r} is not a text file") from None
+
+    if not selected:
+        raise ToolExecutionError(f"start_line {start} is past the end of {path!r}")
+
+    result = "".join(selected)
+    result_size = len(result.encode("utf-8"))
+    if result_size > MAX_FILE_BYTES:
+        raise ToolExecutionError(
+            f"requested range too large ({result_size} bytes, limit {MAX_FILE_BYTES}) - narrow the range"
+        )
+    return result
 
 def write_file(path: str, content: str, create_dirs: bool = False) -> str:
     roots = _workspace_roots()
@@ -157,6 +200,84 @@ def remember(text: str) -> str:
     fact = global_memory.add_fact(text)
     return f"remembered: {fact['text']!r}"
 
+def list_directory(path: str, recursive: bool = False) -> str:
+    roots = _workspace_roots()
+    candidate = _resolve_path(path, roots)
+    if candidate is None:
+        raise ToolExecutionError(f"path {path!r} is outside every allowed location")
+
+    if not candidate.exists():
+        raise ToolExecutionError(f"no such directory: {path!r}")
+    if not candidate.is_dir():
+        raise ToolExecutionError(f"not a directory: {path!r}")
+
+    if recursive:
+        entries = [
+            e for e in candidate.rglob("*")
+            if not _NOISE_DIR_NAMES & set(e.relative_to(candidate).parts)
+        ]
+        names = [
+            f"{e.relative_to(candidate)}/" if e.is_dir() else str(e.relative_to(candidate))
+            for e in sorted(entries)
+        ]
+    else:
+        names = [f"{e.name}/" if e.is_dir() else e.name for e in sorted(candidate.iterdir())]
+
+    if not names:
+        return f"{path} is empty"
+
+    truncated = len(names) > MAX_LIST_ENTRIES
+    listing = "\n".join(names[:MAX_LIST_ENTRIES])
+    if truncated:
+        listing += f"\n... truncated at {MAX_LIST_ENTRIES} of {len(names)} entries - narrow the path"
+    return listing
+
+def search(pattern: str, path: str | None = None, ignore_case: bool = False) -> str:
+    roots = _workspace_roots()
+
+    if path is not None:
+        candidate = _resolve_path(path, roots)
+        if candidate is None:
+            raise ToolExecutionError(f"path {path!r} is outside every allowed location")
+        if not candidate.exists():
+            raise ToolExecutionError(f"no such path: {path!r}")
+        search_targets = [candidate]
+    else:
+        search_targets = roots
+
+    rg_path = shutil.which("rg")
+    if rg_path is None:
+        raise ToolExecutionError("ripgrep ('rg') isn't installed or isn't on PATH")
+
+    base_cmd = [rg_path, "--line-number", "--with-filename", "--no-heading", "--color=never"]
+    if ignore_case:
+        base_cmd.append("--ignore-case")
+
+    lines: list[str] = []
+    for target in search_targets:
+        proc = subprocess.run(
+            [*base_cmd, "--", pattern, str(target)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        # rg exits 1 for "no matches" (not an error), 2 for a real error.
+        if proc.returncode == 2:
+            raise ToolExecutionError(f"search failed: {proc.stderr.strip()}")
+        if proc.stdout:
+            lines.extend(proc.stdout.splitlines())
+        if len(lines) >= MAX_SEARCH_RESULTS:
+            break
+
+    if not lines:
+        return "no matches"
+
+    truncated = len(lines) > MAX_SEARCH_RESULTS
+    result = "\n".join(lines[:MAX_SEARCH_RESULTS])
+    if truncated:
+        result += f"\n... truncated at {MAX_SEARCH_RESULTS} results - narrow the pattern or path"
+    return result
+
 def read_file_tool_def() -> dict:
     roots = _workspace_roots()
     return {
@@ -167,7 +288,10 @@ def read_file_tool_def() -> dict:
                 "Read the contents of a text file. Allowed locations: "
                 f"{_describe_roots(roots)}. Inside a directory entry, any "
                 "file within it (including subdirectories) is readable; a "
-                "file entry only allows that exact file."
+                "file entry only allows that exact file. Whole-file reads "
+                f"are capped at {MAX_FILE_BYTES} bytes - for a larger file, "
+                "pass start_line/end_line (1-indexed, inclusive) to read a "
+                "slice instead."
             ),
             "parameters": {
                 "type": "object",
@@ -175,7 +299,15 @@ def read_file_tool_def() -> dict:
                     "path": {
                         "type": "string",
                         "description": "Absolute path, or a path relative to one of the allowed directories.",
-                    }
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to read, 1-indexed. Omit to read from the start of the file.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to read, inclusive. Omit to read to the end of the file.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -244,10 +376,83 @@ def remember_tool_def() -> dict:
         },
     }
 
-TOOLS = {"read_file": read_file, "write_file": write_file, "remember": remember}
+def list_directory_tool_def() -> dict:
+    roots = _workspace_roots()
+    return {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": (
+                "List the contents of a directory. Allowed locations: "
+                f"{_describe_roots(roots)}. Non-recursive by default (like "
+                "`ls`); set recursive=true for a full tree (like `tree`), "
+                "which skips common noise directories (.git, node_modules, "
+                "__pycache__, .venv, build artifacts, ...) and is capped at "
+                f"{MAX_LIST_ENTRIES} entries. Directory entries end with '/'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path, or a path relative to one of the allowed directories.",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "List the full subtree instead of just the immediate contents. Default false.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    }
+
+def search_tool_def() -> dict:
+    roots = _workspace_roots()
+    return {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Search file contents for a regex pattern (ripgrep/Rust "
+                "regex syntax), returning matches as "
+                "'path:line:matched_text'. Allowed locations: "
+                f"{_describe_roots(roots)}. Omit path to search everywhere "
+                "allowed; give a directory or file to narrow it. Respects "
+                f".gitignore automatically, capped at {MAX_SEARCH_RESULTS} "
+                "results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for (ripgrep/Rust regex syntax).",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search within. Omit to search every allowed location.",
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case-insensitive search. Default false.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    }
+
+TOOLS = {
+    "read_file": read_file,
+    "write_file": write_file,
+    "remember": remember,
+    "list_directory": list_directory,
+    "search": search,
+}
 
 def build_tool_defs() -> list[dict]:
-    defs = [read_file_tool_def(), write_file_tool_def()]
+    defs = [read_file_tool_def(), write_file_tool_def(), list_directory_tool_def(), search_tool_def()]
     if global_memory.is_enabled():
         defs.append(remember_tool_def())
     return defs

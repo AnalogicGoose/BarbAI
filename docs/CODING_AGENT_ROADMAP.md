@@ -123,18 +123,35 @@ this piece landing first.
     Claude Code precedent (which shares nothing with claude.ai's memory)
     — the divergence is intentional, not an oversight.
 
-### Phase 3.1 — Expanded local tool suite
+### Phase 3.1 — Expanded local tool suite — read-only half done
 `read_file`/`write_file` are whole-file only and capped at 100KB/1MB —
 fine for a general assistant, not enough for real repo work. New tools,
 all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
-- `list_directory` (`ls`/`tree`-style) — read-only, **ungated** (matches
-  `read_file`'s precedent: routine reads aren't gated).
-- `search` (ripgrep-backed) — read-only, **ungated**, returns
-  `file:line` matches instead of requiring the model to guess which file
-  to open.
-- Line-range reads for large files — either extend `read_file` with
-  optional `start`/`end` line params, or a separate tool; needed because
-  a real source file can exceed `MAX_FILE_BYTES`.
+- **Done.** `list_directory` (`core/tools.py`) — read-only, ungated,
+  `ls`-style by default, `recursive=true` for a `tree`-style full
+  listing that skips common noise directories (`.git`, `node_modules`,
+  `__pycache__`, `.venv`, build artifacts, ...) and is capped at 500
+  entries.
+- **Done.** `search` (`core/tools.py`) — read-only, ungated, shells out
+  to ripgrep (`rg`) rather than reimplementing regex/gitignore/binary
+  handling, returning `path:line:matched_text` results, capped at 200.
+  Requires the `rg` binary on `PATH` - not a Python dependency, so it's
+  not in `pyproject.toml`; install it separately (see README). Verified
+  live against a running server: correctly chains with `list_directory`
+  and `read_file` to answer real "where is X defined" questions.
+- **Done.** Line-range reads — extended `read_file` with optional
+  `start_line`/`end_line` (1-indexed, inclusive) rather than adding a
+  separate tool. Streams the file instead of reading it whole first, so
+  a narrow range on a file far past `MAX_FILE_BYTES` still works; the
+  *returned slice* is still capped at `MAX_FILE_BYTES`. Verified
+  byte-exact against the real file on disk in a live test.
+- **Observed, not yet acted on:** a live two-tool-call request (search,
+  then a line-range read) occasionally hit `MAX_ITERATIONS` (10) even
+  though both tools work correctly in isolation and the same combined
+  request succeeds on a retry - sampling variance on a genuinely
+  multi-step task, not a tool bug. Worth revisiting when Phase 3.2's
+  loop work happens: either raise `MAX_ITERATIONS` or make the
+  per-round accounting cheaper now that there are more tools to chain.
 - `patch_file` — search/replace or unified-diff based surgical edit,
   replacing whole-file overwrite for precise changes (pillar 2's
   "surgical patching," and the actual reason `write_file` alone won't

@@ -1,9 +1,23 @@
 import os
+import shutil
 
 import pytest
 
 from barbai.core.global_memory import load_facts
-from barbai.core.tools import GATED_TOOLS, ToolExecutionError, build_tool_defs, read_file, remember, write_file
+from barbai.core.tools import (
+    GATED_TOOLS,
+    ToolExecutionError,
+    build_tool_defs,
+    list_directory,
+    read_file,
+    remember,
+    search,
+    write_file,
+)
+
+requires_ripgrep = pytest.mark.skipif(
+    shutil.which("rg") is None, reason="ripgrep ('rg') not installed on this machine"
+)
 
 
 @pytest.fixture
@@ -224,3 +238,165 @@ def test_build_tool_defs_excludes_remember_when_disabled(global_memory_store, mo
     monkeypatch.setenv("BARBAI_GLOBAL_MEMORY", "off")
     names = [d["function"]["name"] for d in build_tool_defs()]
     assert "remember" not in names
+
+
+@pytest.fixture
+def tree_workspace(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "README.md").write_text("readme")
+    (root / "src").mkdir()
+    (root / "src" / "main.py").write_text("def main():\n    return needle_value\n")
+    (root / "src" / "lib.py").write_text("class Helper:\n    pass\n")
+    (root / "src" / "sub").mkdir()
+    (root / "src" / "sub" / "deep.py").write_text("NEEDLE = 1\n")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "junk.js").write_text("should be filtered out")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("git internals")
+
+    monkeypatch.setenv("BARBAI_TOOLS_ROOTS", str(root))
+    return root
+
+
+def test_list_directory_non_recursive(tree_workspace):
+    result = list_directory(".")
+    entries = result.splitlines()
+    assert "README.md" in entries
+    assert "src/" in entries
+    assert "node_modules/" in entries  # top-level noise dirs still shown non-recursively
+
+
+def test_list_directory_recursive_filters_noise_dirs(tree_workspace):
+    result = list_directory(".", recursive=True)
+    assert "src/main.py" in result
+    assert "src/sub/deep.py" in result
+    assert "node_modules" not in result
+    assert ".git" not in result
+
+
+def test_list_directory_missing_dir_rejected(tree_workspace):
+    with pytest.raises(ToolExecutionError):
+        list_directory("does_not_exist")
+
+
+def test_list_directory_rejects_a_file(tree_workspace):
+    with pytest.raises(ToolExecutionError):
+        list_directory("README.md")
+
+
+def test_list_directory_outside_allowlist_rejected(tree_workspace):
+    with pytest.raises(ToolExecutionError):
+        list_directory(str(tree_workspace.parent))
+
+
+def test_list_directory_empty(tree_workspace):
+    (tree_workspace / "empty_dir").mkdir()
+    assert list_directory("empty_dir") == "empty_dir is empty"
+
+
+def test_list_directory_truncates(tree_workspace, monkeypatch):
+    monkeypatch.setattr("barbai.core.tools.MAX_LIST_ENTRIES", 2)
+    result = list_directory(".", recursive=True)
+    assert "truncated" in result
+
+
+@requires_ripgrep
+def test_search_finds_match(tree_workspace):
+    result = search("needle_value")
+    assert "src/main.py" in result
+    assert "needle_value" in result
+
+
+@requires_ripgrep
+def test_search_no_matches(tree_workspace):
+    assert search("nothing_matches_this_xyz") == "no matches"
+
+
+@requires_ripgrep
+def test_search_scoped_to_path(tree_workspace):
+    result = search("NEEDLE", path="src/sub")
+    assert "deep.py" in result
+    result_root = search("needle_value", path="src/sub")
+    assert result_root == "no matches"
+
+
+@requires_ripgrep
+def test_search_ignore_case(tree_workspace):
+    result = search("NEEDLE_VALUE", ignore_case=True)
+    assert "main.py" in result
+
+
+@requires_ripgrep
+def test_search_case_sensitive_by_default(tree_workspace):
+    assert search("NEEDLE_VALUE") == "no matches"
+
+
+def test_search_path_outside_allowlist_rejected(tree_workspace):
+    with pytest.raises(ToolExecutionError):
+        search("anything", path=str(tree_workspace.parent))
+
+
+@requires_ripgrep
+def test_search_respects_gitignore(tree_workspace):
+    (tree_workspace / ".gitignore").write_text("ignored.py\n")
+    (tree_workspace / "ignored.py").write_text("needle_value")
+    result = search("needle_value")
+    assert "ignored.py" not in result
+    assert "src/main.py" in result
+
+
+def test_search_missing_ripgrep(tree_workspace, monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(ToolExecutionError):
+        search("needle_value")
+
+
+def test_read_file_range(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\nline3\nline4\n")
+    assert read_file("multi.txt", start_line=2, end_line=3) == "line2\nline3\n"
+
+
+def test_read_file_range_from_start(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\nline3\n")
+    assert read_file("multi.txt", end_line=2) == "line1\nline2\n"
+
+
+def test_read_file_range_to_end(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\nline3\n")
+    assert read_file("multi.txt", start_line=2) == "line2\nline3\n"
+
+
+def test_read_file_range_past_end_of_file_rejected(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\n")
+    with pytest.raises(ToolExecutionError):
+        read_file("multi.txt", start_line=10)
+
+
+def test_read_file_range_invalid_order_rejected(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\nline3\n")
+    with pytest.raises(ToolExecutionError):
+        read_file("multi.txt", start_line=3, end_line=1)
+
+
+def test_read_file_range_start_below_one_rejected(workspace):
+    (workspace / "multi.txt").write_text("line1\nline2\n")
+    with pytest.raises(ToolExecutionError):
+        read_file("multi.txt", start_line=0)
+
+
+def test_read_file_range_bypasses_whole_file_size_cap(workspace):
+    line = "x" * 100 + "\n"  # 101 bytes/line - small on its own, big in bulk
+    (workspace / "big_ranged.txt").write_text(line * 2000)  # ~202,000 bytes total
+    # whole-file read still rejected...
+    with pytest.raises(ToolExecutionError):
+        read_file("big_ranged.txt")
+    # ...but a narrow range within it works
+    assert read_file("big_ranged.txt", start_line=1, end_line=1) == line
+
+
+def test_read_file_range_oversized_slice_still_rejected(workspace):
+    line = "x" * 100 + "\n"
+    (workspace / "big_ranged.txt").write_text(line * 2000)  # ~202,000 bytes total
+    with pytest.raises(ToolExecutionError):
+        read_file("big_ranged.txt", start_line=1, end_line=2000)  # the whole thing, via a range
