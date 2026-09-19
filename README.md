@@ -9,7 +9,10 @@ reasoning-effort switch per request.
 Full design rationale, hardware-tiering strategy, and phased build plan live
 in [`docs/BARBAI_ROADMAP.md`](docs/BARBAI_ROADMAP.md). The sub-phase plan for
 Coding mode specifically lives in
-[`docs/CODING_AGENT_ROADMAP.md`](docs/CODING_AGENT_ROADMAP.md).
+[`docs/CODING_AGENT_ROADMAP.md`](docs/CODING_AGENT_ROADMAP.md). Everything
+below describes today's **dev-mode** setup (source checkout, `uv`, env
+vars) — the plan for turning this into an installable app with a bundled
+web UI lives in [`docs/PACKAGING_ROADMAP.md`](docs/PACKAGING_ROADMAP.md).
 
 ## Status
 

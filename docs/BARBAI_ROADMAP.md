@@ -194,6 +194,12 @@ v1. Revisit only after the core loop below is solid.
 
 ## Roadmap
 
+Phases 1–3 (here and in `docs/CODING_AGENT_ROADMAP.md`) are all dev-mode
+work: a source checkout run with `uv`. Turning that into something a
+regular user can install - a bundled web UI, an actual installer, no env
+vars to hand-configure - is its own phase, broken down separately in
+[`docs/PACKAGING_ROADMAP.md`](PACKAGING_ROADMAP.md).
+
 ### Phase 2.0 — Core loop (single machine, text only) — done, and then some
 - FastAPI service — shipped with *three* wire-compatible surfaces instead
   of just OpenAI: `POST /v1/chat/completions` (OpenAI-compatible),
