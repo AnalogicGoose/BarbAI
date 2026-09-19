@@ -10,15 +10,18 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from barbai.core import model_runtime
-from barbai.core.tool_calls import UnrecognizedToolCallFormatError, to_openai_message
+from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
 router = APIRouter()
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
@@ -33,9 +36,11 @@ class ToolFunctionDef(BaseModel):
     description: str | None = None
     parameters: dict = {}
 
+
 class ToolDef(BaseModel):
     type: Literal["function"] = "function"
     function: ToolFunctionDef
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -43,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ToolDef] | None = None
     tool_choice: str | dict | None = None
     stream: bool = False
+
 
 def _prepare_messages(messages: list[ChatMessage]) -> list[dict]:
     """
@@ -67,11 +73,84 @@ def _prepare_messages(messages: list[ChatMessage]) -> list[dict]:
         prepared.append(d)
     return prepared
 
+
+def _stream_chat_completions(llm, messages, model_name: str, **kwargs) -> Iterator[str]:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    parser = TagStreamParser()
+    tool_call_index = 0
+    emitted_tool_call = False
+
+    def sse(delta: dict, finish_reason: str | None = None) -> str:
+        payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield sse({"role": "assistant"})
+
+    raw_stream = llm.create_chat_completion(messages=cast(Any, messages), stream=True, **kwargs)
+    finish_reason = "stop"
+    for chunk in raw_stream:
+        choice = chunk["choices"][0]
+        delta = choice.get("delta", {})
+
+        if delta.get("tool_calls"):
+            # native path: the model/parser already gave structured calls,
+            # bypass the tag state machine entirely for this chunk.
+            for tc in delta["tool_calls"]:
+                yield sse({"tool_calls": [{"index": tool_call_index, **tc}]})
+                tool_call_index += 1
+                emitted_tool_call = True
+            continue
+
+        content = delta.get("content")
+        if content:
+            for event in parser.feed(content):
+                if event["type"] == "reasoning":
+                    yield sse({"reasoning_content": event["text"]})
+                elif event["type"] == "content":
+                    yield sse({"content": event["text"]})
+                elif event["type"] == "tool_call":
+                    yield sse(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": tool_call_index,
+                                    "id": event["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": event["name"],
+                                        "arguments": json.dumps(event["arguments"]),
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                    tool_call_index += 1
+                    emitted_tool_call = True
+
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+
+    for event in parser.finish():
+        if event["type"] == "reasoning":
+            yield sse({"reasoning_content": event["text"]})
+        elif event["type"] == "content":
+            yield sse({"content": event["text"]})
+
+    if emitted_tool_call:
+        finish_reason = "tool_calls"
+    yield sse({}, finish_reason=finish_reason)
+    yield "data: [DONE]\n\n"
+
+
 @router.post("/v1/chat/completions")
 def chat_completions(request: ChatCompletionRequest):
-    if request.stream:
-        raise HTTPException(status_code=501, detail="streaming not implemented yet")
-
     try:
         llm = model_runtime.get_model()
     except RuntimeError as exc:
@@ -84,6 +163,13 @@ def chat_completions(request: ChatCompletionRequest):
         kwargs["tool_choice"] = request.tool_choice
 
     messages = _prepare_messages(request.messages)
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_chat_completions(llm, messages, request.model, **kwargs),
+            media_type="text/event-stream",
+        )
+
     # llama-cpp-python's type stubs want its own narrow TypedDict union;
     # plain dicts are what it actually accepts and uses at runtime.
     raw = llm.create_chat_completion(messages=cast(Any, messages), **kwargs)

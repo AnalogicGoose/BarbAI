@@ -9,15 +9,18 @@ without the id/object/created/choices/usage envelope those formats require.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from barbai.core import model_runtime
-from barbai.core.tool_calls import UnrecognizedToolCallFormatError, to_openai_message
+from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
 router = APIRouter()
+
 
 class NativeToolCall(BaseModel):
     id: str
@@ -31,6 +34,7 @@ class NativeMessage(BaseModel):
     tool_calls: list[NativeToolCall] | None = None
     tool_call_id: str | None = None
 
+
 class NativeTool(BaseModel):
     name: str
     description: str | None = None
@@ -41,6 +45,8 @@ class NativeChatRequest(BaseModel):
     messages: list[NativeMessage]
     system: str | None = None
     tools: list[NativeTool] | None = None
+    stream: bool = False
+
 
 def _to_llama_messages(request: NativeChatRequest) -> list[dict]:
     messages: list[dict] = []
@@ -60,6 +66,7 @@ def _to_llama_messages(request: NativeChatRequest) -> list[dict]:
         messages.append(d)
     return messages
 
+
 def _to_llama_tools(tools: list[NativeTool] | None) -> list[dict] | None:
     if not tools:
         return None
@@ -67,6 +74,45 @@ def _to_llama_tools(tools: list[NativeTool] | None) -> list[dict] | None:
         {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}
         for t in tools
     ]
+
+
+def _stream_chat(llm, messages: list[dict], **kwargs) -> Iterator[str]:
+    parser = TagStreamParser()
+
+    def sse(event: dict) -> str:
+        return f"data: {json.dumps(event)}\n\n"
+
+    raw_stream = llm.create_chat_completion(messages=cast(Any, messages), stream=True, **kwargs)
+    for chunk in raw_stream:
+        delta = chunk["choices"][0].get("delta", {})
+
+        if delta.get("tool_calls"):
+            for tc in delta["tool_calls"]:
+                yield sse(
+                    {
+                        "type": "tool_call",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": json.loads(tc["function"]["arguments"]),
+                    }
+                )
+            continue
+
+        content = delta.get("content")
+        if content:
+            for event in parser.feed(content):
+                if event["type"] in ("reasoning", "content"):
+                    yield sse({"type": event["type"], "text": event["text"]})
+                elif event["type"] == "tool_call":
+                    yield sse(
+                        {"type": "tool_call", "id": event["id"], "name": event["name"], "arguments": event["arguments"]}
+                    )
+
+    for event in parser.finish():
+        yield sse({"type": event["type"], "text": event["text"]})
+
+    yield sse({"type": "done"})
+
 
 @router.post("/chat")
 def chat(request: NativeChatRequest):
@@ -81,6 +127,10 @@ def chat(request: NativeChatRequest):
         kwargs["tools"] = tools
 
     messages = _to_llama_messages(request)
+
+    if request.stream:
+        return StreamingResponse(_stream_chat(llm, messages, **kwargs), media_type="text/event-stream")
+
     raw = llm.create_chat_completion(messages=cast(Any, messages), **kwargs)
 
     try:
