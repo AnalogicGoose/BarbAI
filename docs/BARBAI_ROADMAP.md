@@ -191,57 +191,91 @@ v1. Revisit only after the core loop below is solid.
 
 ## Roadmap
 
-### Phase 2.0 — Core loop (single machine, text only)
-- FastAPI service exposing one endpoint shape: OpenAI-compatible
-  `/v1/chat/completions`, streamed via SSE.
-- `llama-cpp-python` loading a GGUF model. This replaces the NumPy engine
-  as the actual brain — Phase 1's engine has served its (educational)
-  purpose.
-- Hardware-detection module (`nvidia-smi` via subprocess, or `pynvml`) that
-  picks a model tier per the table in section 1, so the same codebase
-  behaves correctly on all three laptops without per-GPU branches.
+### Phase 2.0 — Core loop (single machine, text only) — done, and then some
+- FastAPI service — shipped with *three* wire-compatible surfaces instead
+  of just OpenAI: `POST /v1/chat/completions` (OpenAI-compatible),
+  `POST /v1/messages` (Anthropic-compatible), and `POST /chat` (BarbAI's
+  own minimal native shape, no vendor envelope). All three stream via SSE
+  (`stream: true`), including correct mid-stream tool-call detection.
+- `llama-cpp-python` loading a GGUF model, CUDA-accelerated. Replaces the
+  NumPy engine as the actual brain — Phase 1's engine has served its
+  (educational) purpose.
+- Hardware-detection module (`src/barbai/core/hardware.py`, `nvidia-smi`
+  via subprocess) picks a model tier per the table in section 1.
+- Not originally scoped here, added along the way: a default BarbAI
+  identity/persona (`src/barbai/core/persona.py`, always injected unless
+  the caller overrides it, with custom prompts layered on top rather than
+  replacing it) and a `fast` / `thinking` / `extended` reasoning-effort
+  switch per request (`src/barbai/core/model_runtime.py`) — Qwen3.5 is a
+  reasoning model that otherwise always pays for a "thinking" pass, even
+  on trivial questions.
 
-### Phase 2.1 — Model tiers for the 3 target machines
-- Verify actual `nvidia-smi`-reported VRAM on each of the 3050/4070/5070 Ti
-  laptops (not the spec-sheet number) and pin down real tier boundaries
-  for our own hardware, mirroring section 1's table.
-- Pick one General model + one Coding model per profile row, Q4-class
-  quantized, sized to leave VRAM headroom for the OS/desktop (per the
-  Product Shape section above) — not "the largest that technically fits."
+### Phase 2.1 — Model tiers for the 3 target machines — partially done
+- Verified on real hardware: **RTX 4070 only** (this dev machine). Idle
+  free VRAM measures ~7780MiB out of 8188MiB total — confirms free VRAM
+  runs meaningfully below total even at idle, which is why tiering is
+  based on free VRAM, not the spec-sheet number.
+- 3050 and 5070 Ti: **still not verified** — nobody's had that hardware in
+  hand yet. The 5070 Ti's spec used here was also corrected mid-project
+  from an earlier (wrong) "16GB" assumption to the real ~12GB.
+- Current tier boundaries (`core/hardware.py`), recalibrated from Mana's
+  original numbers (which assumed a 16GB reference card) against what's
+  actually been measured plus the corrected 5070 Ti spec:
 
-**RTX 4070 (8GB) candidates — current as of a Sept 2026 web pass, not yet
-verified against our own hardware or benchmarked head-to-head, so treat as
-a shortlist to test rather than a final pick. These sizes assume a mostly-
-idle desktop, not concurrent gaming/heavy GPU use — see the free-VRAM-check
-note above:**
+  | Free VRAM | Tier | Machine (assumed, only 4070 confirmed) |
+  |---|---|---|
+  | < 7168MiB | `fast` | 3050 |
+  | 7168–10240MiB | `default` | 4070 ✅ confirmed |
+  | ≥ 10240MiB | `quality` | 5070 Ti (estimated, not measured) |
 
-| Role | Candidates | Notes |
-|---|---|---|
-| Coding | Qwen2.5-Coder 7B; CodeGemma 7B (backup) | Qwen2.5-Coder was the code-specialized pick in Mana's own `coding` profile too — but section 2 above found *this exact model* unreliable at tool-calling (wraps tool JSON in a markdown fence instead of its own template's tags). Verify tool-calling before committing. |
-| General | Qwen3.5 9B (~6.6GB Q4, leaves headroom on 8GB); Llama 3.3 8B; IBM Granite 4.1 8B (strong tool-calling); Mistral Small 3 7B (fastest tokens/sec) | Phi-4-mini also came up specifically for *reliable structured-output/tool-calling at small size*, worth a look if the 7-9B options are unreliable callers. |
+  The `default`/`quality` boundary (10240) is an estimate assuming the
+  5070 Ti loses a similar ~400MiB to idle desktop/driver overhead as the
+  4070 does — verify for real once someone has that laptop.
+- General model **picked and fully validated** for the `default` tier:
+  **Qwen3.5-9B, Q4_K_M** (`bartowski/Qwen_Qwen3.5-9B-GGUF`). CUDA-loads
+  fully offloaded, tool-calling verified reliable (see Phase 2.2 note
+  below), persona/thinking-mode features all tested against it.
+- No Coding-mode model has been picked or tested yet, for any tier.
+- `fast`/`quality` tier candidates (3050 / 5070 Ti): still not researched.
 
-3050 (4-6GB) and 5070 Ti (~12GB) candidates: not yet researched — repeat
-this pass for those tiers once the 4070 picks are validated end-to-end.
-
-### Phase 2.2 — Tool calling
-- Test the chosen model's tool-calling reliability directly (per section
-  2's method) before building a loop around it.
-- Ship exactly one read-only tool first (file read, scoped to an
-  allowlisted root, reject path traversal / absolute paths outside root).
-  Hold off on write/shell tools until that loop is proven solid.
-- Approval gate modeled on section 3: gate agent-authored artifacts before
-  they're trusted, not every routine call.
+### Phase 2.2 — Tool calling — read-only tool done, write/shell tools not started
+- Tool-calling reliability tested directly against Qwen3.5-9B (per section
+  2's method): the model reliably emits well-formed tool calls, but in its
+  *own* tag format (`<tool_call><function=...><parameter=...>`), not the
+  Hermes-style JSON `llama-cpp-python`'s built-in parser expects — same
+  class of mismatch section 2 flagged for Qwen2.5-Coder-7B. Handled with a
+  custom parser (`core/tool_calls.py`, `parse_tool_call_tags` /
+  `TagStreamParser` for the streaming case) that falls back only when the
+  native parser comes up empty.
+- Shipped exactly one tool, as planned: `read_file`
+  (`core/tools.py`), read-only, scoped to an allowlist
+  (`BARBAI_TOOLS_ROOTS`, comma-separated) that can mix whole directories
+  and individual files, and supports multiple attached roots at once
+  (Codex-style) — rejects path traversal and absolute-path escapes in
+  either case. Wired into a new server-side agent loop (`core/agent.py`,
+  `POST /agent/chat`) that executes the tool itself and loops until the
+  model gives a final answer, unlike the three passthrough endpoints,
+  which correctly hand a `tool_call` back to the caller instead (that's
+  the right behavior for OpenAI/Anthropic-client compatibility).
+- Write/shell tools: **not started**, per the "hold off" guidance below.
+- Approval gate (section 3): **not built**. Not needed yet either — the
+  only tool that exists is a routine read, which section 3's own model
+  (Mana) explicitly does *not* gate. Becomes relevant once a write/shell
+  tool is added.
 
 ### Phase 2.3 — Memory
 - Start dumb: rolling conversation window + a session log.
 - Add a vector store (Chroma or LanceDB) only once the lack of retrieval is
   actually felt — don't build it speculatively.
 
-### Phase 2.4 — Collaboration setup
-- This repo isn't a git repository yet. Before a friend joins:
-  `git init`, push to a private GitHub repo, and consider a Mana-style
-  layout (`core/` API service + `plugins/` for independent features) so
-  two people can work on separate pieces without colliding on one file.
+### Phase 2.4 — Collaboration setup — mostly done
+- Git repo initialized, pushed to a private GitHub repo
+  (`AnalogicGoose/BarbAI`). The `core/` (provider-agnostic model logic) +
+  `api/` (one module per wire format) split from the Mana-style layout
+  suggestion is already in place, though there's no separate `plugins/`
+  package yet — not needed until a second contributor actually shows up
+  and needs to work on an independent piece without colliding.
+- Not done: no automated tests exist anywhere in the project yet.
 
 ### Deferred
 Voice (whisper.cpp STT + a TTS provider), avatar, remote messaging
