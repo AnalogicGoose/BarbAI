@@ -152,10 +152,25 @@ all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
   multi-step task, not a tool bug. Worth revisiting when Phase 3.2's
   loop work happens: either raise `MAX_ITERATIONS` or make the
   per-round accounting cheaper now that there are more tools to chain.
-- `patch_file` — search/replace or unified-diff based surgical edit,
-  replacing whole-file overwrite for precise changes (pillar 2's
-  "surgical patching," and the actual reason `write_file` alone won't
-  scale to real editing). **Gated**, same reasoning as `write_file`.
+- **Done.** `patch_file` (`core/tools.py`) — exact-string search/replace
+  (`old_string`/`new_string`, `replace_all` to change every match instead
+  of requiring exactly one), the same shape as Claude Code's own Edit
+  tool rather than a unified diff - far more forgiving for a small local
+  model to produce correctly than line-numbered diff hunks. **Gated**,
+  same reasoning as `write_file`. Only edits existing files (use
+  `write_file` to create one).
+  - **Cross-platform correctness (Linux/macOS/Windows is a hard
+    requirement - see project memory):** detects and preserves a file's
+    *existing* line-ending convention (`\r\n` vs `\n`) rather than
+    letting Python's default text-mode write silently normalize it to
+    whatever the host OS prefers - editing one line of a Windows-authored
+    CRLF file from a Linux server no longer rewrites every line ending in
+    it. `write_file` got the same fix for the same reason (see
+    `core/tools.py::_detect_newline`). Verified live, not just unit
+    tested: asked the running model to edit a genuine CRLF file via
+    `patch_file`, approved the gated call, and confirmed byte-for-byte
+    that every remaining line ending stayed `\r\n` - only the intended
+    line changed.
 - `run_command` — a real shell/PTY tool (`npm run build`, `pytest`, ...).
   **Gated.** Scoped to a working-directory allowlist (mirror
   `BARBAI_TOOLS_ROOTS`), with a timeout and an output-size cap. Command

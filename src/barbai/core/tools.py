@@ -25,6 +25,15 @@ way for hardware detection (nvidia-smi). Always invoked as an argument
 list (never shell=True), with `--` before the user-supplied pattern, so
 neither the pattern nor a resolved path can be interpreted as a flag or
 reach a shell.
+
+Cross-platform (Linux/macOS/Windows is a hard requirement, not aspirational):
+write_file and patch_file both detect and preserve a file's *existing*
+line-ending convention (\r\n on Windows, \n on Unix/macOS) rather than
+letting Python's default text-mode write silently normalize it to
+whatever the host OS prefers - that would otherwise mean editing a single
+line of a Windows-authored file on a Linux server rewrites every line
+ending in it. A brand-new file just gets \n, the portable default every
+OS's tooling handles fine. See _detect_newline.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ MAX_REMEMBER_CHARS = 500
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
 
-GATED_TOOLS = {"write_file", "remember"}
+GATED_TOOLS = {"write_file", "remember", "patch_file"}
 
 _NOISE_DIR_NAMES = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
@@ -104,6 +113,14 @@ def _resolve_path(path: str, roots: list[Path], *, must_exist: bool = True) -> P
         return candidate
 
     return None
+
+def _detect_newline(raw: bytes) -> str:
+    """Sniff a file's existing line-ending convention from its raw bytes -
+    \r\n if any CRLF is present, else \n. Used to preserve that convention
+    on write instead of letting the host OS's text-mode default decide,
+    which would otherwise silently rewrite every line ending in a file
+    whenever any tool touches it (see module docstring)."""
+    return "\r\n" if b"\r\n" in raw else "\n"
 
 def _describe_roots(roots: list[Path]) -> str:
     parts = []
@@ -173,7 +190,15 @@ def write_file(path: str, content: str, create_dirs: bool = False) -> str:
     if candidate.exists() and candidate.is_dir():
         raise ToolExecutionError(f"not a file: {path!r}")
 
-    size = len(content.encode("utf-8"))
+    # Preserve an existing file's line-ending convention rather than the
+    # host OS's default (see module docstring); a brand-new file gets the
+    # portable \n default. Normalize any stray \r first so this can't
+    # double up an already-CRLF fragment into \r\r\n.
+    newline = _detect_newline(candidate.read_bytes()) if candidate.exists() else "\n"
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    on_disk = normalized.replace("\n", newline) if newline != "\n" else normalized
+
+    size = len(on_disk.encode("utf-8"))
     if size > MAX_WRITE_BYTES:
         raise ToolExecutionError(f"content too large ({size} bytes, limit {MAX_WRITE_BYTES})")
 
@@ -184,8 +209,74 @@ def write_file(path: str, content: str, create_dirs: bool = False) -> str:
             )
         candidate.parent.mkdir(parents=True, exist_ok=True)
 
-    candidate.write_text(content, encoding="utf-8")
-    return f"wrote {len(content)} characters to {path}"
+    with candidate.open("w", encoding="utf-8", newline="") as f:
+        f.write(on_disk)
+    return f"wrote {len(normalized)} characters to {path}"
+
+def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Surgical edit: replace exact text rather than rewriting the whole
+    file, the same old_string/new_string shape as Claude Code's own Edit
+    tool - old_string must match exactly once (or replace_all=true to
+    change every match), which is far more forgiving for a small local
+    model to produce correctly than a unified diff with line numbers."""
+    roots = _workspace_roots()
+    candidate = _resolve_path(path, roots)
+    if candidate is None:
+        raise ToolExecutionError(f"path {path!r} is outside every allowed location")
+
+    if not candidate.exists():
+        raise ToolExecutionError(
+            f"no such file: {path!r} - patch_file only edits existing files, use write_file to create one"
+        )
+    if not candidate.is_file():
+        raise ToolExecutionError(f"not a file: {path!r}")
+
+    raw = candidate.read_bytes()
+    if len(raw) > MAX_FILE_BYTES:
+        raise ToolExecutionError(
+            f"file too large ({len(raw)} bytes, limit {MAX_FILE_BYTES}) - patch_file reads the whole file to apply the edit"
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolExecutionError(f"{path!r} is not a text file") from None
+
+    if not old_string:
+        raise ToolExecutionError("old_string cannot be empty")
+    if old_string == new_string:
+        raise ToolExecutionError("old_string and new_string are identical - nothing to change")
+
+    # Match against \n-normalized content - the same convention read_file
+    # already hands the model, so old_string/new_string are written
+    # against that, never the file's raw on-disk bytes.
+    newline = _detect_newline(raw)
+    normalized = text.replace("\r\n", "\n")
+
+    count = normalized.count(old_string)
+    if count == 0:
+        raise ToolExecutionError(f"old_string not found in {path!r}")
+    if count > 1 and not replace_all:
+        raise ToolExecutionError(
+            f"old_string matches {count} times in {path!r} - make it more specific and unique, "
+            "or pass replace_all=true to replace every match"
+        )
+
+    replaced = count if replace_all else 1
+    updated = normalized.replace(old_string, new_string, -1 if replace_all else 1)
+
+    on_disk = updated.replace("\n", newline) if newline != "\n" else updated
+    size = len(on_disk.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        raise ToolExecutionError(f"result too large ({size} bytes, limit {MAX_WRITE_BYTES})")
+
+    # Preserve the file's original line-ending convention on write (see
+    # module docstring) - never let this or the host OS silently convert
+    # a Windows CRLF file to LF (or vice versa) as a side effect.
+    with candidate.open("w", encoding="utf-8", newline="") as f:
+        f.write(on_disk)
+
+    return f"replaced {replaced} occurrence{'s' if replaced != 1 else ''} in {path}"
 
 def remember(text: str) -> str:
     if not global_memory.is_enabled():
@@ -347,6 +438,49 @@ def write_file_tool_def() -> dict:
         },
     }
 
+def patch_file_tool_def() -> dict:
+    roots = _workspace_roots()
+    return {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": (
+                "Replace an exact piece of text in an existing file, "
+                "instead of rewriting the whole thing - the precise way "
+                "to make a small edit. Allowed locations: "
+                f"{_describe_roots(roots)}. old_string must match the "
+                "file's current content exactly (read the file first) "
+                "and must be unique in the file unless replace_all is "
+                "set - include enough surrounding context in old_string "
+                "to make it unique rather than guessing. Fails clearly if "
+                "old_string isn't found or matches more than once. "
+                "Requires human approval before it actually runs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path, or a path relative to one of the allowed directories. Must already exist.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find and replace, including any surrounding context needed to make it unique.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The text to replace it with.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_string instead of requiring exactly one match. Default false.",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    }
+
 def remember_tool_def() -> dict:
     return {
         "type": "function",
@@ -446,13 +580,20 @@ def search_tool_def() -> dict:
 TOOLS = {
     "read_file": read_file,
     "write_file": write_file,
+    "patch_file": patch_file,
     "remember": remember,
     "list_directory": list_directory,
     "search": search,
 }
 
 def build_tool_defs() -> list[dict]:
-    defs = [read_file_tool_def(), write_file_tool_def(), list_directory_tool_def(), search_tool_def()]
+    defs = [
+        read_file_tool_def(),
+        write_file_tool_def(),
+        patch_file_tool_def(),
+        list_directory_tool_def(),
+        search_tool_def(),
+    ]
     if global_memory.is_enabled():
         defs.append(remember_tool_def())
     return defs

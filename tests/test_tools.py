@@ -9,6 +9,7 @@ from barbai.core.tools import (
     ToolExecutionError,
     build_tool_defs,
     list_directory,
+    patch_file,
     read_file,
     remember,
     search,
@@ -400,3 +401,106 @@ def test_read_file_range_oversized_slice_still_rejected(workspace):
     (workspace / "big_ranged.txt").write_text(line * 2000)  # ~202,000 bytes total
     with pytest.raises(ToolExecutionError):
         read_file("big_ranged.txt", start_line=1, end_line=2000)  # the whole thing, via a range
+
+
+def test_patch_file_replaces_unique_match(workspace):
+    (workspace / "code.py").write_text("def foo():\n    return 1\n")
+    patch_file("code.py", "return 1", "return 2")
+    assert read_file("code.py") == "def foo():\n    return 2\n"
+
+
+def test_patch_file_no_match_rejected(workspace):
+    (workspace / "code.py").write_text("def foo():\n    return 1\n")
+    with pytest.raises(ToolExecutionError):
+        patch_file("code.py", "return 99", "return 2")
+
+
+def test_patch_file_ambiguous_match_rejected_without_replace_all(workspace):
+    (workspace / "code.py").write_text("x = 1\ny = 1\n")
+    with pytest.raises(ToolExecutionError):
+        patch_file("code.py", "= 1", "= 2")
+
+
+def test_patch_file_replace_all(workspace):
+    (workspace / "code.py").write_text("x = 1\ny = 1\n")
+    patch_file("code.py", "= 1", "= 2", replace_all=True)
+    assert read_file("code.py") == "x = 2\ny = 2\n"
+
+
+def test_patch_file_identical_strings_rejected(workspace):
+    (workspace / "code.py").write_text("return 1\n")
+    with pytest.raises(ToolExecutionError):
+        patch_file("code.py", "return 1", "return 1")
+
+
+def test_patch_file_empty_old_string_rejected(workspace):
+    (workspace / "code.py").write_text("return 1\n")
+    with pytest.raises(ToolExecutionError):
+        patch_file("code.py", "", "something")
+
+
+def test_patch_file_missing_file_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        patch_file("does_not_exist.py", "a", "b")
+
+
+def test_patch_file_rejects_creating_new_files(workspace):
+    with pytest.raises(ToolExecutionError):
+        patch_file("brand_new.py", "a", "b")
+    assert not (workspace / "brand_new.py").exists()
+
+
+def test_patch_file_outside_allowlist_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        patch_file(str(workspace.parent / "outside.py"), "a", "b")
+
+
+def test_patch_file_oversized_file_rejected(workspace):
+    (workspace / "big.py").write_text("x" * 200_000)
+    with pytest.raises(ToolExecutionError):
+        patch_file("big.py", "x", "y")
+
+
+def test_patch_file_oversized_result_rejected(workspace):
+    (workspace / "code.py").write_text("MARKER\n")
+    with pytest.raises(ToolExecutionError):
+        patch_file("code.py", "MARKER", "y" * 2_000_000)
+
+
+def test_patch_file_is_gated():
+    assert "patch_file" in GATED_TOOLS
+
+
+# --- Cross-platform: line-ending preservation (Windows CRLF vs Unix LF) ---
+
+
+def test_patch_file_preserves_crlf_line_endings(workspace):
+    raw = b"def foo():\r\n    return 1\r\n    return 2\r\n"
+    (workspace / "crlf.py").write_bytes(raw)
+    patch_file("crlf.py", "return 1", "return 100")
+    result = (workspace / "crlf.py").read_bytes()
+    assert result == b"def foo():\r\n    return 100\r\n    return 2\r\n"
+    assert b"\n" not in result.replace(b"\r\n", b"")  # no bare \n snuck in anywhere
+
+
+def test_patch_file_preserves_lf_line_endings(workspace):
+    raw = b"def foo():\n    return 1\n    return 2\n"
+    (workspace / "lf.py").write_bytes(raw)
+    patch_file("lf.py", "return 1", "return 100")
+    result = (workspace / "lf.py").read_bytes()
+    assert result == b"def foo():\n    return 100\n    return 2\n"
+    assert b"\r" not in result
+
+
+def test_write_file_preserves_crlf_on_existing_file(workspace):
+    (workspace / "crlf.txt").write_bytes(b"line1\r\nline2\r\n")
+    write_file("crlf.txt", "line1\nline2\nline3")
+    result = (workspace / "crlf.txt").read_bytes()
+    assert result == b"line1\r\nline2\r\nline3"
+
+
+def test_write_file_new_file_uses_lf(workspace):
+    write_file("brand_new.txt", "line1\nline2")
+    result = (workspace / "brand_new.txt").read_bytes()
+    assert result == b"line1\nline2"
+    assert b"\r" not in result
