@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from barbai.api.native import router as native_router
 from barbai.api.openai import router as openai_router
 from barbai.api.anthropic import router as anthropic_router
+from barbai.api.agent import router as agent_router
 from barbai.core import model_runtime
 from barbai.core.hardware import InsufficientVramError, NoGpuDetectedError, Tier, detect_tier
 
@@ -41,6 +42,7 @@ app = FastAPI(title="BarbAI", version="0.1.0", lifespan=lifespan)
 app.include_router(native_router)
 app.include_router(openai_router)
 app.include_router(anthropic_router)
+app.include_router(agent_router)
 
 @app.get("/health")
 def health() -> dict:
