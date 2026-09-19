@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+from barbai.core import model_runtime
 from barbai.core.tool_calls import UnrecognizedToolCallFormatError, to_openai_message
 from barbai.core.tools import ToolExecutionError, build_tool_defs, execute_tool
 
@@ -20,13 +21,17 @@ MAX_ITERATIONS = 5
 class AgentError(RuntimeError):
     """The loop couldn't produce a final answer (model error or ran out of iterations)."""
 
-def run_agent(llm, messages: list[dict], max_iterations: int = MAX_ITERATIONS) -> dict:
+def run_agent(
+    llm, messages: list[dict], max_iterations: int = MAX_ITERATIONS, thinking_mode: str = "thinking"
+) -> dict:
     """Run the loop, returning the final assistant message (no tool_calls)."""
     messages = list(messages)
     tool_defs = build_tool_defs()
 
     for _ in range(max_iterations):
-        raw = llm.create_chat_completion(messages=messages, tools=tool_defs)
+        raw = model_runtime.create_chat_completion(
+            llm, messages=messages, tools=tool_defs, thinking_mode=thinking_mode
+        )
         try:
             message = to_openai_message(raw["choices"][0]["message"])
         except UnrecognizedToolCallFormatError as exc:

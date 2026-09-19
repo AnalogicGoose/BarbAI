@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from barbai.core import model_runtime
+from barbai.core.persona import build_system_prompt
 from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
 router = APIRouter()
@@ -49,6 +50,7 @@ class MessagesRequest(BaseModel):
     tool_choice: ToolChoice | None = None
     stream: bool = False
     temperature: float | None = None
+    thinking: Literal["fast", "thinking", "extended"] = "thinking"
 
 
 def _block_text(block: dict) -> str:
@@ -58,13 +60,13 @@ def _block_text(block: dict) -> str:
 def _to_llama_messages(request: MessagesRequest) -> list[dict]:
     messages: list[dict] = []
 
-    if request.system:
-        system_text = (
-            request.system
-            if isinstance(request.system, str)
-            else "\n".join(b.get("text", "") for b in request.system if b.get("type") == "text")
-        )
-        messages.append({"role": "system", "content": system_text})
+    if isinstance(request.system, str):
+        custom_system = request.system
+    elif request.system:
+        custom_system = "\n".join(b.get("text", "") for b in request.system if b.get("type") == "text")
+    else:
+        custom_system = None
+    messages.append({"role": "system", "content": build_system_prompt(custom_system, request.thinking)})
 
     for m in request.messages:
         if isinstance(m.content, str):
@@ -205,8 +207,8 @@ def _stream_messages(llm, llama_messages: list[dict], model_name: str, max_token
         yield sse("content_block_delta", {"index": block_index, "delta": {"type": "input_json_delta", "partial_json": args_str}})
         yield close_block()
 
-    raw_stream = llm.create_chat_completion(
-        messages=cast(Any, llama_messages), max_tokens=max_tokens, stream=True, **kwargs
+    raw_stream = model_runtime.create_chat_completion(
+        llm, messages=cast(Any, llama_messages), max_tokens=max_tokens, stream=True, **kwargs
     )
     any_tool_call = False
     llama_finish_reason = "stop"
@@ -258,7 +260,7 @@ def messages(request: MessagesRequest):
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        kwargs: dict = {}
+        kwargs: dict = {"thinking_mode": request.thinking}
         tools = _to_llama_tools(request.tools)
         if tools:
             kwargs["tools"] = tools
@@ -277,7 +279,7 @@ def messages(request: MessagesRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    kwargs: dict = {}
+    kwargs: dict = {"thinking_mode": request.thinking}
     tools = _to_llama_tools(request.tools)
     if tools:
         kwargs["tools"] = tools
@@ -286,7 +288,8 @@ def messages(request: MessagesRequest):
         kwargs["tool_choice"] = tool_choice
 
     llama_messages = _to_llama_messages(request)
-    raw = llm.create_chat_completion(
+    raw = model_runtime.create_chat_completion(
+        llm,
         messages=cast(Any, llama_messages),
         max_tokens=request.max_tokens,
         **kwargs,

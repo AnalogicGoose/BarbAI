@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from barbai.core import model_runtime
+from barbai.core.persona import build_system_prompt
 from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
 router = APIRouter()
@@ -48,9 +49,10 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ToolDef] | None = None
     tool_choice: str | dict | None = None
     stream: bool = False
+    thinking: Literal["fast", "thinking", "extended"] = "thinking"
 
 
-def _prepare_messages(messages: list[ChatMessage]) -> list[dict]:
+def _prepare_messages(messages: list[ChatMessage], thinking_mode: str) -> list[dict]:
     """
     Convert request messages to llama-cpp-python's expected shape.
 
@@ -61,8 +63,12 @@ def _prepare_messages(messages: list[ChatMessage]) -> list[dict]:
     template rendering instead of a normal API error.
     """
     prepared = []
+    system_found = False
     for m in messages:
         d = m.model_dump(exclude_none=True)
+        if d.get("role") == "system" and not system_found:
+            d["content"] = build_system_prompt(d.get("content"), thinking_mode)
+            system_found = True
         for tool_call in d.get("tool_calls") or []:
             args = tool_call.get("function", {}).get("arguments")
             if isinstance(args, str):
@@ -71,6 +77,8 @@ def _prepare_messages(messages: list[ChatMessage]) -> list[dict]:
                 except json.JSONDecodeError:
                     pass
         prepared.append(d)
+    if not system_found:
+        prepared.insert(0, {"role": "system", "content": build_system_prompt(None, thinking_mode)})
     return prepared
 
 
@@ -93,7 +101,7 @@ def _stream_chat_completions(llm, messages, model_name: str, **kwargs) -> Iterat
 
     yield sse({"role": "assistant"})
 
-    raw_stream = llm.create_chat_completion(messages=cast(Any, messages), stream=True, **kwargs)
+    raw_stream = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), stream=True, **kwargs)
     finish_reason = "stop"
     for chunk in raw_stream:
         choice = chunk["choices"][0]
@@ -156,13 +164,13 @@ def chat_completions(request: ChatCompletionRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    kwargs = {}
+    kwargs = {"thinking_mode": request.thinking}
     if request.tools:
         kwargs["tools"] = [t.model_dump(exclude_none=True) for t in request.tools]
     if request.tool_choice is not None:
         kwargs["tool_choice"] = request.tool_choice
 
-    messages = _prepare_messages(request.messages)
+    messages = _prepare_messages(request.messages, request.thinking)
 
     if request.stream:
         return StreamingResponse(
@@ -172,7 +180,7 @@ def chat_completions(request: ChatCompletionRequest):
 
     # llama-cpp-python's type stubs want its own narrow TypedDict union;
     # plain dicts are what it actually accepts and uses at runtime.
-    raw = llm.create_chat_completion(messages=cast(Any, messages), **kwargs)
+    raw = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), **kwargs)
 
     try:
         message = to_openai_message(raw["choices"][0]["message"])

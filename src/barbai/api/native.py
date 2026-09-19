@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from barbai.core import model_runtime
+from barbai.core.persona import build_system_prompt
 from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
 router = APIRouter()
@@ -46,12 +47,13 @@ class NativeChatRequest(BaseModel):
     system: str | None = None
     tools: list[NativeTool] | None = None
     stream: bool = False
+    thinking: Literal["fast", "thinking", "extended"] = "thinking"
 
 
 def _to_llama_messages(request: NativeChatRequest) -> list[dict]:
-    messages: list[dict] = []
-    if request.system:
-        messages.append({"role": "system", "content": request.system})
+    messages: list[dict] = [
+        {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
+    ]
     for m in request.messages:
         d: dict = {"role": m.role}
         if m.content is not None:
@@ -82,7 +84,7 @@ def _stream_chat(llm, messages: list[dict], **kwargs) -> Iterator[str]:
     def sse(event: dict) -> str:
         return f"data: {json.dumps(event)}\n\n"
 
-    raw_stream = llm.create_chat_completion(messages=cast(Any, messages), stream=True, **kwargs)
+    raw_stream = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), stream=True, **kwargs)
     for chunk in raw_stream:
         delta = chunk["choices"][0].get("delta", {})
 
@@ -121,7 +123,7 @@ def chat(request: NativeChatRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    kwargs = {}
+    kwargs = {"thinking_mode": request.thinking}
     tools = _to_llama_tools(request.tools)
     if tools:
         kwargs["tools"] = tools
@@ -131,7 +133,7 @@ def chat(request: NativeChatRequest):
     if request.stream:
         return StreamingResponse(_stream_chat(llm, messages, **kwargs), media_type="text/event-stream")
 
-    raw = llm.create_chat_completion(messages=cast(Any, messages), **kwargs)
+    raw = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), **kwargs)
 
     try:
         message = to_openai_message(raw["choices"][0]["message"])

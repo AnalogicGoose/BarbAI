@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from barbai.core import model_runtime
 from barbai.core.agent import AgentError, run_agent
+from barbai.core.persona import build_system_prompt
 
 router = APIRouter()
 
@@ -26,6 +27,7 @@ class AgentMessage(BaseModel):
 class AgentChatRequest(BaseModel):
     messages: list[AgentMessage]
     system: str | None = None
+    thinking: Literal["fast", "thinking", "extended"] = "thinking"
 
 @router.post("/agent/chat")
 def agent_chat(request: AgentChatRequest):
@@ -34,13 +36,13 @@ def agent_chat(request: AgentChatRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    messages: list[dict] = []
-    if request.system:
-        messages.append({"role": "system", "content": request.system})
+    messages: list[dict] = [
+        {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
+    ]
     messages.extend(m.model_dump() for m in request.messages)
 
     try:
-        final = run_agent(llm, messages)
+        final = run_agent(llm, messages, thinking_mode=request.thinking)
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
