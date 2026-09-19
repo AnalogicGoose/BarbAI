@@ -44,23 +44,58 @@ this doc:
 
 ## Sub-phases
 
-### Phase 3.0 — Foundation: a second model, and a way to switch to it
+### Phase 3.0 — Foundation: a second model, and a way to switch to it — mostly done
 Coding mode is a *different model*, loaded instead of General's (roadmap:
 only one model in VRAM at a time). Nothing else in this doc works without
 this piece landing first.
-- Pick and validate a coding-capable model per hardware tier, the same
-  way Qwen3.5-9B was validated for General (`docs/BARBAI_ROADMAP.md`
-  section 2's method: test tool-calling reliability against the specific
-  model before building on it, don't assume "coding-tuned" implies
-  compliant tool-call output). **Blocked on real hardware**, same
-  blocker Phase 2.1 already has for the 3050/5070 Ti tiers.
-- `core/model_runtime.py`: a mode concept (`general` / `coding`) mapping
-  to a model path + tier table, using the existing
-  `load_model`/`unload_model` to switch.
-- A Coding-specific persona layer, parallel to `DEFAULT_SYSTEM_PROMPT` —
-  needs its own instruction: explain the fix afterward, don't just dump a
-  diff (this is the actual product differentiator vs. "snippet
-  generator" per the original roadmap's framing).
+- **Done.** `core/model_runtime.py`: a mode concept (`MODES = ("general",
+  "coding")`) with `ensure_mode(mode)` — loads/switches only when the
+  requested mode isn't already active, so staying in one mode never pays
+  for a reload. `BARBAI_CODING_MODEL_PATH` selects the Coding-mode GGUF,
+  falling back to `BARBAI_MODEL_PATH`/the General default until a real
+  coding model is picked (next bullet) — the switching mechanism is fully
+  usable and tested today with Qwen3.5-9B standing in for both modes.
+- **Done.** A Coding-specific persona (`CODING_SYSTEM_PROMPT` in
+  `core/persona.py`) — instructs the model to explain the fix afterward,
+  not just dump a diff (the actual product differentiator vs. "snippet
+  generator" per the original roadmap's framing). `build_system_prompt`
+  takes a `mode` param that picks the base identity; everything else
+  (thinking nudge, remembered facts, custom prompt) layers on top the
+  same way regardless of mode.
+- **Done.** `/agent/chat` is mode-aware: a `"mode": "general" | "coding"`
+  field (default `"general"`) picks the model via `ensure_mode` and the
+  persona via `build_system_prompt`. `/chat` and the OpenAI/Anthropic
+  passthroughs are still General-only by design (see that endpoint's own
+  docstring) — a mode switch via `/agent/chat` affects what they serve
+  too, since there's only ever one model loaded process-wide, but they
+  have no `mode` field of their own.
+- **Decided, `default` tier: no dedicated coding model — reuse
+  Qwen3.5-9B.** Full reasoning in `docs/BARBAI_ROADMAP.md` Phase 2.1: the
+  obvious pick (Qwen2.5-Coder-7B) is the exact model this project already
+  found broken for structured tool calls, no official small Qwen3.5-Coder
+  exists yet, and the one community coder fine-tune of Qwen3.5-9B is
+  unvetted. So `mode: "coding"` on the `default` tier is, for now,
+  deliberately just "General's model with a different system prompt" -
+  not a placeholder waiting to be filled in, an actual decision to defer
+  a separate model until Phase 3.1+ usage shows Qwen3.5-9B is actually
+  insufficient for coding tasks.
+- **`fast` tier (3050), both modes: Qwen3.5-4B, tested on simulated
+  hardware (fallback Qwen3.5-2B, also tested).** Full results in
+  `docs/BARBAI_ROADMAP.md` Phase 2.1 - validated via `scripts/hog_vram.py`
+  forcing this dev machine's free VRAM down into the `fast` tier's range,
+  not real 3050 hardware. Qwen3.5-4B: clean load, correct tier detection,
+  3/3 reliable tool calls, approval gate confirmed working. Qwen3.5-2B
+  (deliberately tested under a tighter simulated constraint, the actual
+  scenario it exists for): tool calls stayed 6/6 structurally reliable,
+  but about half its replies leaked planning-talk into the final answer
+  instead of a clean direct response - a real quality gap, not just
+  "smaller and a bit worse." Use 4B whenever it fits; 2B is a fallback
+  for VRAM too tight for 4B, not an equivalent option. Real 3050
+  confirmation is still the open item.
+- **Not started:** enforcing Coding-only tools by mode (the `mode` field
+  currently only affects model/persona, not tool exposure) — moot until
+  Phase 3.1 actually adds Coding-only tools like `patch_file`/
+  `run_command`; nothing to restrict yet.
 - **Resolved — memory/context scoping.** Checked against how Claude Code
   and Codex actually do this: neither splits by a flat "chatbot vs.
   coding agent" switch — Claude Code scopes history **per project**
@@ -72,14 +107,14 @@ this piece landing first.
     already just an opaque caller-supplied string — a Coding-mode client
     derives it from the working directory (e.g. a hash of the project
     path) instead of a random id, and General vs. Coding sessions are
-    already fully isolated with the mechanism that exists today. Two
-    small additions still worth making once Phase 3.0 lands: (1)
-    mode-scoped storage roots so the files are organized on disk
-    (`sessions/general/` vs `sessions/coding/<project>/`, not one flat
-    directory) rather than a functional requirement, and (2) a `mode`
-    field on the request so `/agent/chat` can enforce Coding-only tools
-    (`write_file`, later `run_command`/`patch_file`) never get offered
-    in General mode.
+    already fully isolated with the mechanism that exists today. One
+    small addition still worth making: mode-scoped storage roots so the
+    files are organized on disk (`sessions/general/` vs
+    `sessions/coding/<project>/`, not one flat directory) — an
+    organizational nicety, not a functional requirement. The `/agent/chat`
+    `mode` field itself already exists (Phase 3.0 above); using it to
+    enforce Coding-only tools is Phase 3.1's job, once Coding-only tools
+    (`patch_file`, `run_command`) actually exist to restrict.
   - **Global memory (`core/global_memory.py`) stays ONE shared store**
     across both modes — decided explicitly, not defaulted. A remembered
     fact is about the *user* ("prefers concise answers"), not the task,

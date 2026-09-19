@@ -238,8 +238,70 @@ v1. Revisit only after the core loop below is solid.
   **Qwen3.5-9B, Q4_K_M** (`bartowski/Qwen_Qwen3.5-9B-GGUF`). CUDA-loads
   fully offloaded, tool-calling verified reliable (see Phase 2.2 note
   below), persona/thinking-mode features all tested against it.
-- No Coding-mode model has been picked or tested yet, for any tier.
-- `fast`/`quality` tier candidates (3050 / 5070 Ti): still not researched.
+- **Coding-mode model, `default` tier — decided: reuse Qwen3.5-9B, no
+  separate coding model for now.** Researched the obvious alternative
+  first: Qwen2.5-Coder-7B tops most "best local coding LLM" rankings, but
+  it's the exact model this project already tested and found broken for
+  structured tool calls (Phase 2.2 note below) — and a fresh check
+  confirms that's not a fluke, it's a widely-documented, well-understood
+  failure (vLLM issues #10952/#32926, multiple client-side workarounds):
+  Qwen2.5-Coder emits the tool-call JSON inside a markdown code fence
+  instead of the tagged format its own template calls for, and gets
+  *worse* at it as the prompt grows (5/5 fenced at ~8k tokens vs. 0/5 at
+  ~200) — the opposite of what a coding agent, which needs to hand it
+  real file contents, can tolerate. No official small Qwen3.5-Coder
+  variant exists yet to fall back to (Qwen's only 3.5-generation coder
+  release so far, Qwen3-Coder-Next, is 80B - far outside this tier); a
+  community fine-tune (`Jackrong/Qwopus3.5-9B-Coder`) exists but is an
+  unvetted single-contributor release with no confirmation it preserves
+  Qwen3.5's tool-call template. Given all that, reusing Qwen3.5-9B costs
+  nothing (Phase 3.0's `BARBAI_CODING_MODEL_PATH` already falls back to
+  it) and inherits tool-calling reliability that's actually verified,
+  rather than adding an unvalidated model for a marginal, unconfirmed
+  coding-quality gain. Revisit only once real Coding-mode usage (Phase
+  3.1+) shows Qwen3.5-9B is actually insufficient for coding tasks - not
+  before, matching this project's "don't build until the lack is felt"
+  bias elsewhere (Phase 2.3's vector-store deferral, Phase 3.4's
+  AST/retrieval deferral).
+- **`fast`-tier model, both modes — Qwen3.5-4B, validated on simulated
+  hardware.** Same in-family reasoning as the `default` tier pick above:
+  Qwen's official 0.8B/2B/4B/9B GGUF variants (released March 2026) very
+  likely share Qwen3.5-9B's tag-based tool-call format, already handled
+  by `core/tool_calls.py`, versus an unrelated small model needing its
+  own from-scratch validation. **Tested** on this project's own 4070
+  with a script (`scripts/hog_vram.py`) that grabs GPU memory via a raw
+  `cudaMalloc` call to force `core/hardware.py`'s free-VRAM detection
+  down into the `fast` tier's range (<7168MiB) without needing to own a
+  3050 - not a substitute for real 3050 hardware, but real validation
+  rather than a paper pick. Result at ~5.8GB free: loaded cleanly,
+  `/health` correctly reported `fast`, and 3/3 `/agent/chat` requests
+  requiring a `read_file` tool call returned correct, well-formed
+  results - the same reliability bar Qwen3.5-9B was validated against
+  (Phase 2.2 below). The `write_file` approval-gate pause was also
+  confirmed working correctly at this model size.
+- **Fallback, tighter VRAM — Qwen3.5-2B, tested, real quality caveat
+  found.** Tested the same way at a deliberately tighter ~3.9GB free
+  (simulating a worse-case 4GB 3050 SKU, the actual scenario this
+  fallback exists for): loaded cleanly, tier detection correct, and tool
+  calls were still **6/6 structurally well-formed** - the narrow
+  "does it call tools correctly" bar Phase 2.2's method checks for. But
+  a distinct, reproducible quality problem showed up in the same test
+  run: in roughly half the replies, the model's final answer (the
+  `reply` field, not `reasoning`) was self-narration ("The user asked me
+  to... I should respond with this information in a friendly way as
+  BarbAI would.") instead of a clean direct answer - the underlying
+  facts were usually still in there, just wrapped in leaked
+  planning-talk rather than stated directly. This is real evidence
+  Qwen3.5-2B is meaningfully worse than 4B for actual use, not just a
+  smaller/slower version of the same thing - reach for 4B whenever it
+  fits, and treat 2B as a last resort for VRAM too tight for 4B, not an
+  equivalent alternative.
+- Both are models Qwen released and GGUF-quantized directly, both are
+  downloaded and sitting in `models/` on this dev machine already
+  (`Qwen3.5-4B-Q4_K_M.gguf`, `Qwen3.5-2B-Q4_K_M.gguf`) - a real 3050
+  owner can confirm these results without re-downloading anything.
+- `quality`-tier (5070 Ti) candidates: still not researched - out of
+  scope for this pass, revisit when that hardware question comes up.
 
 ### Phase 2.2 — Tool calling — read + write tools done, gated by an approval flow; shell tool not started
 - Tool-calling reliability tested directly against Qwen3.5-9B (per section

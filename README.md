@@ -22,8 +22,20 @@ memory, and an explicit-only global memory that persists across every
 conversation are all built and tested. Phase 2.1's other two target
 laptops (3050, 5070 Ti) still need real hardware to verify against.
 Coding mode is planned in sub-phases (see
-`docs/CODING_AGENT_ROADMAP.md`) but not started — no shell/exec tool, no
-second model, no mode switching yet.
+`docs/CODING_AGENT_ROADMAP.md`); the mode-switching mechanism itself
+(`/agent/chat`'s `mode` field, a Coding-specific persona) is built and
+tested. No dedicated coding model — decided, not just unfinished: the
+obvious pick (Qwen2.5-Coder-7B) is the model this project already found
+broken for structured tool calls, so `mode: "coding"` deliberately
+reuses Qwen3.5-9B with a different system prompt until real usage shows
+that's actually insufficient. `fast`-tier model (Qwen3.5-4B, both modes)
+is tested and working — validated on this dev machine by artificially
+constraining free VRAM into the `fast` tier's range (see
+`scripts/hog_vram.py`), not real 3050 hardware. The Qwen3.5-2B fallback
+is also tested and works, but is noticeably lower quality (tool calls
+stay reliable, but replies sometimes leak planning-talk instead of
+answering directly) — use 4B whenever it fits. There's still no
+shell/exec tool.
 
 ## API
 
@@ -54,6 +66,18 @@ message(s) each turn instead of the full history, same idea as OpenAI's
 Responses API `previous_response_id` chaining. Omit it and both endpoints
 behave exactly as the stateless passthrough described above. Not
 supported yet together with `"stream": true` on `/chat`.
+
+`/agent/chat` additionally accepts `"mode": "general" | "coding"`
+(default `"general"`). Switching mode reloads whichever model that mode
+points at (`BARBAI_MODEL_PATH` for general, `BARBAI_CODING_MODEL_PATH`
+for coding — falls back to the general model until a dedicated coding
+model is picked) and swaps in a Coding-specific persona. This reload is
+synchronous and happens inline on the first request in a new mode, and
+it affects every endpoint, not just `/agent/chat` — the server only ever
+has one model loaded at a time. For Coding-mode work, derive
+`session_id` from the project/working directory instead of a random ID;
+that gives each project its own memory the same way Claude Code scopes
+history per project.
 
 Separately, BarbAI also has **global memory**: a `remember` tool the
 model can call (only when you explicitly ask it to, e.g. "remember
@@ -101,6 +125,16 @@ uvx --from huggingface_hub hf download bartowski/Qwen_Qwen3.5-9B-GGUF --include 
 By default BarbAI looks for `models/Qwen_Qwen3.5-9B-Q4_K_M.gguf` relative to
 the project root. Point it elsewhere with `BARBAI_MODEL_PATH`.
 
+For tighter-VRAM hardware (the `fast` tier — see
+`docs/BARBAI_ROADMAP.md` Phase 2.1), Qwen3.5-4B is tested and
+recommended; Qwen3.5-2B works as a fallback if even that's too tight, but
+is noticeably lower quality (see that same section):
+
+```
+uvx --from huggingface_hub hf download unsloth/Qwen3.5-4B-GGUF --include "Qwen3.5-4B-Q4_K_M.gguf" --local-dir models/
+uvx --from huggingface_hub hf download unsloth/Qwen3.5-2B-GGUF --include "Qwen3.5-2B-Q4_K_M.gguf" --local-dir models/
+```
+
 A different model will very likely need its own tool-call parsing — see
 `core/tool_calls.py`'s module docstring and `docs/BARBAI_ROADMAP.md` section
 2 for why, and how to tell if a new model needs the same treatment.
@@ -111,7 +145,8 @@ Environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BARBAI_MODEL_PATH` | `models/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Path to the GGUF file to load |
+| `BARBAI_MODEL_PATH` | `models/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Path to the GGUF file to load for General mode |
+| `BARBAI_CODING_MODEL_PATH` | falls back to `BARBAI_MODEL_PATH` | Path to the GGUF file to load for Coding mode (`/agent/chat`'s `"mode": "coding"`) |
 | `BARBAI_TOOLS_ROOTS` | current working directory | Comma-separated allowlist for the `read_file`/`write_file` tools — mix whole directories (everything inside readable/writable) and individual files (only that exact file readable, not writable as a new-file target) |
 | `BARBAI_SESSIONS_DIR` | `./sessions` | Where session-memory JSONL logs are written, one file per `session_id` |
 | `BARBAI_GLOBAL_MEMORY` | `on` | Set to `off` to disable the `remember` tool and stop injecting remembered facts into the system prompt |
