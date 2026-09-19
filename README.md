@@ -7,7 +7,9 @@ model's identity) and supports a `fast` / `thinking` / `extended`
 reasoning-effort switch per request.
 
 Full design rationale, hardware-tiering strategy, and phased build plan live
-in [`docs/BARBAI_ROADMAP.md`](docs/BARBAI_ROADMAP.md).
+in [`docs/BARBAI_ROADMAP.md`](docs/BARBAI_ROADMAP.md). The sub-phase plan for
+Coding mode specifically lives in
+[`docs/CODING_AGENT_ROADMAP.md`](docs/CODING_AGENT_ROADMAP.md).
 
 ## Status
 
@@ -18,8 +20,10 @@ server-side agent loop with read/write file tools plus a `remember` tool
 (all gated behind a human approval step), opt-in per-conversation session
 memory, and an explicit-only global memory that persists across every
 conversation are all built and tested. Phase 2.1's other two target
-laptops (3050, 5070 Ti) still need real hardware to verify against;
-Coding mode and a shell tool haven't been started.
+laptops (3050, 5070 Ti) still need real hardware to verify against.
+Coding mode is planned in sub-phases (see
+`docs/CODING_AGENT_ROADMAP.md`) but not started — no shell/exec tool, no
+second model, no mode switching yet.
 
 ## API
 

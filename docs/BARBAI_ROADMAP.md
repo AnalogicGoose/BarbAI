@@ -19,7 +19,10 @@ loaded at a time:
 - **Coding** — an actual agent loop (read the project, find the problem,
   edit files, run tests/commands, verify the fix, explain what/why/result
   afterward), not a snippet generator. This depends on the agent runtime
-  and tool access at least as much as on the model itself.
+  and tool access at least as much as on the model itself. Broken down
+  into buildable sub-phases in
+  [`docs/CODING_AGENT_ROADMAP.md`](CODING_AGENT_ROADMAP.md) — this doc
+  just names it as a destination, that one is the actual plan.
 
 Only one mode's model occupies VRAM at a time: switching modes unloads the
 current model and loads the other. Never run both simultaneously — on an
