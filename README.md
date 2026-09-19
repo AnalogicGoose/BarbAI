@@ -11,12 +11,15 @@ in [`docs/BARBAI_ROADMAP.md`](docs/BARBAI_ROADMAP.md).
 
 ## Status
 
-Phase 2.0 (core loop) and most of Phase 2.2 (tool calling) are done — see
-the roadmap doc for the detailed breakdown. In short: model loading,
-hardware-tier detection, streaming, tool calling, and a server-side agent
-loop with a read-only file tool are all built and tested. Phase 2.1's other
-two target laptops (3050, 5070 Ti) still need real hardware to verify
-against; Coding mode and write/shell tools haven't been started.
+Phase 2.0 (core loop), most of Phase 2.2 (tool calling), and Phase 2.3
+(memory) are done — see the roadmap doc for the detailed breakdown. In
+short: model loading, hardware-tier detection, streaming, tool calling, a
+server-side agent loop with read/write file tools plus a `remember` tool
+(all gated behind a human approval step), opt-in per-conversation session
+memory, and an explicit-only global memory that persists across every
+conversation are all built and tested. Phase 2.1's other two target
+laptops (3050, 5070 Ti) still need real hardware to verify against;
+Coding mode and a shell tool haven't been started.
 
 ## API
 
@@ -32,6 +35,30 @@ Four endpoints, all backed by the same loaded model:
 All support `"stream": true` (SSE) except `/agent/chat`. All accept an
 optional `"thinking": "fast" | "thinking" | "extended"` field (default
 `"thinking"`).
+
+`/agent/chat` can pause mid-loop: if the model requests a gated tool call
+(currently `write_file` or `remember`), the response comes back as
+`{"status": "pending_approval", "pending": [...], "conversation": [...]}`
+instead of a final reply. Resume by calling `/agent/chat` again with that
+same `conversation` plus an `approvals` object mapping each pending call's
+`id` to `true`/`false` — there's no server-side session, so the caller
+holds the paused state between requests.
+
+`/chat` and `/agent/chat` also accept an optional `"session_id"`. Give one
+and BarbAI remembers that conversation itself — send only the new
+message(s) each turn instead of the full history, same idea as OpenAI's
+Responses API `previous_response_id` chaining. Omit it and both endpoints
+behave exactly as the stateless passthrough described above. Not
+supported yet together with `"stream": true` on `/chat`.
+
+Separately, BarbAI also has **global memory**: a `remember` tool the
+model can call (only when you explicitly ask it to, e.g. "remember
+that...") to save a short fact that's then shown to it in *every*
+conversation afterward, regardless of `session_id`. It's off by default
+for auto-writing — nothing is ever remembered unless you ask — and the
+whole feature can be switched off with `BARBAI_GLOBAL_MEMORY=off`. Like
+`write_file`, `remember` is gated: it pauses for approval before the fact
+is actually stored.
 
 Easiest way to try any of them: start the server, then open
 `http://127.0.0.1:8000/docs` for FastAPI's interactive Swagger UI.
@@ -81,7 +108,10 @@ Environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `BARBAI_MODEL_PATH` | `models/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Path to the GGUF file to load |
-| `BARBAI_TOOLS_ROOTS` | current working directory | Comma-separated allowlist for the `read_file` tool — mix whole directories (everything inside readable) and individual files (only that exact file readable) |
+| `BARBAI_TOOLS_ROOTS` | current working directory | Comma-separated allowlist for the `read_file`/`write_file` tools — mix whole directories (everything inside readable/writable) and individual files (only that exact file readable, not writable as a new-file target) |
+| `BARBAI_SESSIONS_DIR` | `./sessions` | Where session-memory JSONL logs are written, one file per `session_id` |
+| `BARBAI_GLOBAL_MEMORY` | `on` | Set to `off` to disable the `remember` tool and stop injecting remembered facts into the system prompt |
+| `BARBAI_GLOBAL_MEMORY_PATH` | `./global_memory.json` | Where remembered facts are stored |
 
 ## Running
 

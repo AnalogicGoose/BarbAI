@@ -11,3 +11,5 @@ wheels/
 
 .idea/
 models/
+sessions/
+global_memory.json

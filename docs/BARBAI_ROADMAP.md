@@ -238,7 +238,7 @@ v1. Revisit only after the core loop below is solid.
 - No Coding-mode model has been picked or tested yet, for any tier.
 - `fast`/`quality` tier candidates (3050 / 5070 Ti): still not researched.
 
-### Phase 2.2 — Tool calling — read-only tool done, write/shell tools not started
+### Phase 2.2 — Tool calling — read + write tools done, gated by an approval flow; shell tool not started
 - Tool-calling reliability tested directly against Qwen3.5-9B (per section
   2's method): the model reliably emits well-formed tool calls, but in its
   *own* tag format (`<tool_call><function=...><parameter=...>`), not the
@@ -247,24 +247,91 @@ v1. Revisit only after the core loop below is solid.
   custom parser (`core/tool_calls.py`, `parse_tool_call_tags` /
   `TagStreamParser` for the streaming case) that falls back only when the
   native parser comes up empty.
-- Shipped exactly one tool, as planned: `read_file`
-  (`core/tools.py`), read-only, scoped to an allowlist
+- Two tools now, both in `core/tools.py`, scoped to the same allowlist
   (`BARBAI_TOOLS_ROOTS`, comma-separated) that can mix whole directories
   and individual files, and supports multiple attached roots at once
   (Codex-style) — rejects path traversal and absolute-path escapes in
-  either case. Wired into a new server-side agent loop (`core/agent.py`,
-  `POST /agent/chat`) that executes the tool itself and loops until the
-  model gives a final answer, unlike the three passthrough endpoints,
-  which correctly hand a `tool_call` back to the caller instead (that's
-  the right behavior for OpenAI/Anthropic-client compatibility).
-- Write/shell tools: **not started**, per the "hold off" guidance below.
-- Approval gate (section 3): **not built**. Not needed yet either — the
-  only tool that exists is a routine read, which section 3's own model
-  (Mana) explicitly does *not* gate. Becomes relevant once a write/shell
-  tool is added.
+  either case:
+  - `read_file` — read-only, unchanged since it first shipped.
+  - `write_file` — creates or overwrites a text file (`create_dirs` to
+    make missing parent directories); resolves a relative path against
+    an existing match first (same priority as `read_file`), falling back
+    to the first configured directory root for a brand-new file.
+- Wired into the server-side agent loop (`core/agent.py`, `POST
+  /agent/chat`) that executes tools itself and loops until the model
+  gives a final answer, unlike the three passthrough endpoints, which
+  correctly hand a `tool_call` back to the caller instead (that's the
+  right behavior for OpenAI/Anthropic-client compatibility).
+- Shell tool: **not started**, per the "hold off" guidance above.
+- Approval gate (section 3): **built**. `GATED_TOOLS` in `core/tools.py`
+  marks which tools need a human decision before they run (currently just
+  `write_file` — `read_file` stays ungated, matching section 3's own
+  model, Mana, which doesn't gate routine reads). When the agent loop
+  hits a gated call it pauses instead of executing it and returns
+  `{"status": "pending_approval", "pending": [...], "messages": [...]}`;
+  the caller resumes by calling `run_agent` again with that same
+  `messages` list and an `approvals` dict mapping each pending
+  `tool_call_id` to `True`/`False`. `POST /agent/chat` mirrors this at
+  the API layer via `conversation` (the opaque paused state) and
+  `approvals` — there's no server-side session store, the caller holds
+  the paused conversation between requests, consistent with this
+  project's "start dumb" bias (Phase 2.3 below). A denied call feeds
+  `"Error: denied by user"` back to the model as the tool result rather
+  than raising, so the model can react and keep going.
 
-### Phase 2.3 — Memory
-- Start dumb: rolling conversation window + a session log.
+### Phase 2.3 — Memory — done, minimal
+- Shipped as planned, "start dumb": `core/memory.py` is a JSONL session
+  log on disk (`sessions/<id>.jsonl`, root configurable via
+  `BARBAI_SESSIONS_DIR`) plus a rolling window (last 20 messages) bounding
+  what's actually replayed to the model each turn — the log itself stays
+  complete regardless of the window.
+- Modeled on OpenAI's Responses API `previous_response_id` chaining
+  (send just the new turn + an id, the server remembers) rather than the
+  stateless Chat Completions/Anthropic Messages shape — deliberately
+  *not* applied to `/v1/chat/completions` or `/v1/messages`, since an
+  external OpenAI/Anthropic-compatible client expects pure passthrough by
+  contract. Opt-in via a new `session_id` field on native `/chat` and
+  `/agent/chat` only: omit it and behavior is exactly the stateless
+  passthrough both endpoints always had.
+- Known simplification: only role/content turns are persisted, not raw
+  `tool_calls`/`tool_call_id` structure — a turn's tool round-trips are
+  already resolved into a final assistant reply within the request that
+  produced them, so there's nothing structurally valid to replay next
+  time regardless. `session_id` + `stream: true` together isn't supported
+  yet on `/chat` (rejected with a 400) — streaming would need to
+  accumulate the full reply before it could be persisted, deferred until
+  it's actually needed.
+- **Global memory (cross-conversation, not per-session) — done, explicit-only.**
+  Session memory above is per-`session_id` and scoped to one conversation;
+  this is the separate "BarbAI remembers things about you across every
+  conversation" feature, decided after comparing how ChatGPT and Claude do
+  it: ChatGPT auto-extracts facts silently, one global store; Claude
+  auto-summarizes whole conversations, scoped per-project, visible and
+  editable. BarbAI does neither yet — shipped the cheapest, safest of the
+  three options discussed: **explicit-only**, nothing is written unless
+  the user directly asks ("remember that...").
+  - `core/global_memory.py`: a small JSON fact store
+    (`global_memory.json`, path configurable via
+    `BARBAI_GLOBAL_MEMORY_PATH`), each fact `{id, text, created_at}`.
+    Toggle via `BARBAI_GLOBAL_MEMORY=off` (default on), checked per call,
+    not just at startup — matches the "can be active or not" requirement.
+  - A new `remember` tool (`core/tools.py`), alongside `read_file` /
+    `write_file`. Its description instructs the model to only call it on
+    an explicit user request, never inferred on its own — enforced at the
+    prompting level, since a tool call can't be structurally prevented.
+    It's excluded from `build_tool_defs()` entirely when global memory is
+    disabled.
+  - `remember` is in `GATED_TOOLS` — same human-approval pause as
+    `write_file` (see Phase 2.2 above), since a misphrased "remembered"
+    fact would otherwise quietly shape every future conversation with no
+    review.
+  - Stored facts are rendered into every system prompt
+    (`core/persona.build_system_prompt`), positioned after the base
+    identity and thinking-mode nudge but before any caller-supplied
+    custom prompt (which still wins on conflict, unchanged from before).
+  - Deferred: Claude-style automatic end-of-session summarization (reusing
+    the Phase 2.3 session log above) is the natural v2 once explicit-only
+    is proven useful in practice — not built yet.
 - Add a vector store (Chroma or LanceDB) only once the lack of retrieval is
   actually felt — don't build it speculatively.
 

@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from barbai.core import model_runtime
+from barbai.core import memory, model_runtime
 from barbai.core.persona import build_system_prompt
 from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
 
@@ -48,13 +48,12 @@ class NativeChatRequest(BaseModel):
     tools: list[NativeTool] | None = None
     stream: bool = False
     thinking: Literal["fast", "thinking", "extended"] = "thinking"
+    session_id: str | None = None
 
 
-def _to_llama_messages(request: NativeChatRequest) -> list[dict]:
-    messages: list[dict] = [
-        {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
-    ]
-    for m in request.messages:
+def _to_llama_messages(messages: list[NativeMessage]) -> list[dict]:
+    converted: list[dict] = []
+    for m in messages:
         d: dict = {"role": m.role}
         if m.content is not None:
             d["content"] = m.content
@@ -65,8 +64,8 @@ def _to_llama_messages(request: NativeChatRequest) -> list[dict]:
             ]
         if m.tool_call_id:
             d["tool_call_id"] = m.tool_call_id
-        messages.append(d)
-    return messages
+        converted.append(d)
+    return converted
 
 
 def _to_llama_tools(tools: list[NativeTool] | None) -> list[dict] | None:
@@ -123,12 +122,19 @@ def chat(request: NativeChatRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    if request.session_id and request.stream:
+        raise HTTPException(status_code=400, detail="session_id isn't supported with stream=true yet")
+
     kwargs = {"thinking_mode": request.thinking}
     tools = _to_llama_tools(request.tools)
     if tools:
         kwargs["tools"] = tools
 
-    messages = _to_llama_messages(request)
+    new_messages = _to_llama_messages(request.messages)
+    history = memory.rolling_window(memory.load_session(request.session_id)) if request.session_id else []
+    messages = [
+        {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
+    ] + history + new_messages
 
     if request.stream:
         return StreamingResponse(_stream_chat(llm, messages, **kwargs), media_type="text/event-stream")
@@ -150,6 +156,12 @@ def chat(request: NativeChatRequest):
             }
             for tc in message["tool_calls"]
         ]
+
+    if request.session_id:
+        to_persist = list(new_messages)
+        if message.get("content") is not None:
+            to_persist.append({"role": "assistant", "content": message["content"]})
+        memory.append_to_session(request.session_id, to_persist)
 
     return {
         "reply": message.get("content"),

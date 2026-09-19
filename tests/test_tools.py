@@ -2,7 +2,13 @@ import os
 
 import pytest
 
-from barbai.core.tools import ToolExecutionError, read_file
+from barbai.core.global_memory import load_facts
+from barbai.core.tools import GATED_TOOLS, ToolExecutionError, build_tool_defs, read_file, remember, write_file
+
+
+@pytest.fixture
+def global_memory_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("BARBAI_GLOBAL_MEMORY_PATH", str(tmp_path / "global_memory.json"))
 
 
 @pytest.fixture
@@ -116,3 +122,105 @@ def test_escapes_root_a_but_lands_in_root_b_is_allowed(multiroot):
     """
     rel = os.path.relpath(multiroot["b"] / "b.txt", start=multiroot["a"])
     assert read_file(rel) == "content of b.txt in project B"
+
+
+def test_write_new_file(workspace):
+    write_file("new.txt", "hello world")
+    assert (workspace / "new.txt").read_text() == "hello world"
+
+
+def test_write_overwrites_existing_file(workspace):
+    write_file("hello.txt", "replaced")
+    assert read_file("hello.txt") == "replaced"
+
+
+def test_write_nested_existing_dir(workspace):
+    write_file("sub/new_nested.txt", "nested content")
+    assert (workspace / "sub" / "new_nested.txt").read_text() == "nested content"
+
+
+def test_write_missing_parent_dir_rejected_without_create_dirs(workspace):
+    with pytest.raises(ToolExecutionError):
+        write_file("newdir/new.txt", "content")
+
+
+def test_write_create_dirs_makes_parents(workspace):
+    write_file("newdir/sub/new.txt", "content", create_dirs=True)
+    assert (workspace / "newdir" / "sub" / "new.txt").read_text() == "content"
+
+
+def test_write_dotdot_traversal_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        write_file("../outside/evil.txt", "pwned")
+
+
+def test_write_absolute_path_escape_rejected(workspace):
+    outside_file = workspace.parent / "outside" / "evil.txt"
+    with pytest.raises(ToolExecutionError):
+        write_file(str(outside_file), "pwned")
+
+
+def test_write_oversized_content_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        write_file("big.txt", "x" * 2_000_000)
+
+
+def test_write_rejects_directory_target(workspace):
+    with pytest.raises(ToolExecutionError):
+        write_file("sub", "content")
+
+
+def test_write_relative_resolves_against_first_directory_root(multiroot):
+    write_file("new_in_a.txt", "goes in project A")
+    assert (multiroot["a"] / "new_in_a.txt").read_text() == "goes in project A"
+
+
+def test_write_relative_overwrites_existing_match_by_priority(multiroot):
+    write_file("shared_name.txt", "overwritten")
+    assert (multiroot["a"] / "shared_name.txt").read_text() == "overwritten"
+    assert (multiroot["b"] / "shared_name.txt").read_text() == "project B's version"
+
+
+def test_remember_is_gated():
+    assert "remember" in GATED_TOOLS
+
+
+def test_remember_stores_a_fact(global_memory_store):
+    remember("likes tea")
+    facts = load_facts()
+    assert len(facts) == 1
+    assert facts[0]["text"] == "likes tea"
+
+
+def test_remember_strips_whitespace(global_memory_store):
+    remember("  likes tea  ")
+    assert load_facts()[0]["text"] == "likes tea"
+
+
+def test_remember_rejects_empty_text(global_memory_store):
+    with pytest.raises(ToolExecutionError):
+        remember("   ")
+
+
+def test_remember_rejects_oversized_text(global_memory_store):
+    with pytest.raises(ToolExecutionError):
+        remember("x" * 501)
+
+
+def test_remember_rejected_when_disabled(global_memory_store, monkeypatch):
+    monkeypatch.setenv("BARBAI_GLOBAL_MEMORY", "off")
+    with pytest.raises(ToolExecutionError):
+        remember("likes tea")
+    assert load_facts() == []
+
+
+def test_build_tool_defs_includes_remember_when_enabled(global_memory_store, monkeypatch):
+    monkeypatch.delenv("BARBAI_GLOBAL_MEMORY", raising=False)
+    names = [d["function"]["name"] for d in build_tool_defs()]
+    assert "remember" in names
+
+
+def test_build_tool_defs_excludes_remember_when_disabled(global_memory_store, monkeypatch):
+    monkeypatch.setenv("BARBAI_GLOBAL_MEMORY", "off")
+    names = [d["function"]["name"] for d in build_tool_defs()]
+    assert "remember" not in names
