@@ -145,13 +145,12 @@ all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
   a narrow range on a file far past `MAX_FILE_BYTES` still works; the
   *returned slice* is still capped at `MAX_FILE_BYTES`. Verified
   byte-exact against the real file on disk in a live test.
-- **Observed, not yet acted on:** a live two-tool-call request (search,
-  then a line-range read) occasionally hit `MAX_ITERATIONS` (10) even
-  though both tools work correctly in isolation and the same combined
-  request succeeds on a retry - sampling variance on a genuinely
-  multi-step task, not a tool bug. Worth revisiting when Phase 3.2's
-  loop work happens: either raise `MAX_ITERATIONS` or make the
-  per-round accounting cheaper now that there are more tools to chain.
+- **Observed here, acted on in Phase 3.2:** a live two-tool-call request
+  (search, then a line-range read) occasionally hit `MAX_ITERATIONS`
+  (10) even though both tools work correctly in isolation and the same
+  combined request succeeds on a retry - sampling variance on a
+  genuinely multi-step task, not a tool bug. Phase 3.2 raised
+  `MAX_ITERATIONS` to 20 to give this real headroom.
 - **Done.** `patch_file` (`core/tools.py`) — exact-string search/replace
   (`old_string`/`new_string`, `replace_all` to change every match instead
   of requiring exactly one), the same shape as Claude Code's own Edit
@@ -203,18 +202,40 @@ all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
     already happening with the current tool set, even before that phase
     formally builds the scaffolding to make it reliable/automatic.
 
-### Phase 3.2 — The Observe-Think-Act-Verify loop
-The existing `run_agent` loop is "call tool → get result → continue
-until no more tool calls." Coding mode needs it to *verify its own work*:
-- After an edit-class tool call (`write_file`/`patch_file`), let the loop
-  call `run_command` to run tests/build, parse stdout/stderr for
-  pass/fail, and automatically loop back to another edit attempt on
-  failure instead of treating the tool result as terminal.
-- A real "loop breakout" beyond the existing iteration count
-  (`MAX_ITERATIONS`): detect no-progress (the same error repeating, no
-  diff between attempts) and stop with an explanation, rather than
-  burning the full iteration budget on a stuck loop.
-- Depends on 3.1 (`patch_file`, `run_command`).
+### Phase 3.2 — The Observe-Think-Act-Verify loop — done
+Turned out to need less new scaffolding than expected, because the
+first half was already happening. A live Phase 3.1 test gave the model
+a broken function and one instruction ("run the tests, fix it, verify")
+and it chained `run_command` → `read_file` → `patch_file` →
+`run_command` correctly on its own, no special-casing required - the
+existing tools plus the existing loop already exhibit
+Observe-Think-Act-Verify emergently. Building a forced "always run tests
+after an edit" step on top of that was considered and rejected: there's
+no reliable way to know what "verify" means for an arbitrary project
+(pytest vs npm test vs cargo test vs ...) without per-project config
+that doesn't exist yet, and it wasn't needed anyway.
+- **Done.** What the loop actually lacked was a way to recognize when
+  that process *stalls* - the real gap, and what this phase built.
+  `core/agent.py` now detects when the exact same tool call (name +
+  arguments) produces the exact same result two rounds in a row and
+  stops with a clear explanation (`{"status": "stuck", ...}`) instead of
+  silently burning the rest of the iteration budget repeating a dead
+  end. Deliberately mechanical (compare round signatures), not an
+  LLM-judged "is this looping" call - simple and predictable beats
+  clever here. Works across an approval-gate pause/resume too, not just
+  within one call, since the check reads from the full conversation
+  history either way. Verified two ways: 5 unit tests covering the
+  trigger case and three ways it must *not* false-positive (different
+  arguments, different results, only one round so far), plus a live
+  request against the real `/agent/chat` API confirming the new `stuck`
+  status and its `conversation` field come back correctly end-to-end.
+- **Done.** `MAX_ITERATIONS` raised from 10 to 20. Not about the
+  gated write/verify loop (each approval pause naturally resets the
+  budget on resume) - it's ungated read-investigation chains
+  (`list_directory`/`search`/`read_file`) that can now legitimately run
+  longer with seven tools available than the three-tool budget this was
+  first tuned against, per the sampling-variance iteration failure noted
+  in Phase 3.1.
 
 ### Phase 3.3 — Safety hardening
 `run_command` and `patch_file` are real risk surface — harden once

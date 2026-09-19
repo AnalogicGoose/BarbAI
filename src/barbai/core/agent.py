@@ -7,22 +7,47 @@ distinct from /v1/chat/completions, /chat, and /v1/messages (which hand a
 tool_call back to whoever's calling and stop; correct behavior for
 OpenAI/Anthropic compat, where the caller runs its own tools).
 
-Gated tools (currently just write_file) don't execute immediately - the
-loop pauses and hands control back to the caller instead of running them,
-per the roadmap's approval-gate design (human review for agent-authored
-writes, not for routine reads). A paused call returns
-{"status": "pending_approval", "pending": [...], "messages": [...]}; the
-caller resumes by calling run_agent again with that same `messages` list
-and an `approvals` dict mapping each pending tool_call_id to True/False.
-There's no server-side session store - the caller holds the paused state
-between requests.
+Gated tools (write_file, patch_file, run_command, remember) don't execute
+immediately - the loop pauses and hands control back to the caller
+instead of running them, per the roadmap's approval-gate design (human
+review for agent-authored writes, not for routine reads). A paused call
+returns {"status": "pending_approval", "pending": [...], "messages": [...]};
+the caller resumes by calling run_agent again with that same `messages`
+list and an `approvals` dict mapping each pending tool_call_id to
+True/False. There's no server-side session store - the caller holds the
+paused state between requests.
 
 Because pausing needs to happen *before* a gated tool executes, and
 resuming must not re-ask the model for a new turn it already answered,
 each iteration does at most one of "call the model" or "resolve the
 pending tool call(s)" rather than both - so a full model-call+execute
 round now costs two iterations instead of one. MAX_ITERATIONS is set
-with that in mind.
+with that in mind, and bumped from the original 10 to 20 (Phase 3.2):
+with seven tools now available and ungated read-investigation chains
+(list_directory/search/read_file) realistically running longer than the
+three-tool budget this was first tuned against, 10 was proving tight for
+legitimate multi-step work, not just runaway loops.
+
+Phase 3.2's other piece: a real "stuck" detector, not just the iteration
+count. If the exact same tool call(s) with the exact same arguments
+produce the exact same result(s) two rounds in a row, that's a strong
+signal nothing is changing - stop and say so plainly
+({"status": "stuck", ...}) rather than silently burning the rest of the
+iteration budget repeating a dead end. This is a mechanical, cheap check
+(compare round signatures), deliberately not an LLM-judged "is this
+looping" call - simple and predictable beats clever here.
+
+Explicitly NOT built here: forcing an automatic verification step after
+every edit (e.g. "always run tests after patch_file"). There's no
+reliable way to know what "verify" means for an arbitrary project
+(pytest vs npm test vs cargo test vs ...) without per-project config that
+doesn't exist yet, and it turned out not to be necessary - a live test
+already showed the model chaining run_command -> read_file -> patch_file
+-> run_command on its own, correctly, with the existing tools and no
+special scaffolding (see docs/CODING_AGENT_ROADMAP.md Phase 3.1). The
+loop already exhibits Observe-Think-Act-Verify emergently; what it
+lacked was a way to recognize when that process stalls, which is what
+this phase actually adds.
 """
 
 from __future__ import annotations
@@ -33,10 +58,45 @@ from barbai.core import model_runtime
 from barbai.core.tool_calls import UnrecognizedToolCallFormatError, to_openai_message
 from barbai.core.tools import GATED_TOOLS, ToolExecutionError, build_tool_defs, execute_tool
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 20
 
 class AgentError(RuntimeError):
     """The loop couldn't produce a final answer (model error or ran out of iterations)."""
+
+def _round_signature(tool_calls: list[dict], results_by_id: dict[str, str]) -> tuple:
+    """A comparable fingerprint for one resolved tool-call round: each
+    call's name, its arguments, and the result it got back, order-
+    independent. Two identical signatures in a row means the model took
+    the exact same action and got the exact same outcome - no progress."""
+    return tuple(sorted(
+        (
+            tc["function"]["name"],
+            json.dumps(tc["function"]["arguments"], sort_keys=True),
+            results_by_id.get(tc["id"], ""),
+        )
+        for tc in tool_calls
+    ))
+
+def _extract_round_signatures(messages: list[dict]) -> list[tuple]:
+    """Walk the conversation and pull out every resolved tool-call round's
+    signature, in order. A "round" is one assistant tool_calls message
+    plus the tool-result messages immediately following it."""
+    signatures = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_calls = msg["tool_calls"]
+            results_by_id: dict[str, str] = {}
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                results_by_id[messages[j]["tool_call_id"]] = messages[j].get("content", "")
+                j += 1
+            signatures.append(_round_signature(tool_calls, results_by_id))
+            i = j
+        else:
+            i += 1
+    return signatures
 
 def run_agent(
     llm,
@@ -45,8 +105,11 @@ def run_agent(
     thinking_mode: str = "thinking",
     approvals: dict[str, bool] | None = None,
 ) -> dict:
-    """Run the loop. Returns {"status": "final", "message": {...}} or
-    {"status": "pending_approval", "pending": [...], "messages": [...]}."""
+    """Run the loop. Returns one of:
+    {"status": "final", "message": {...}}
+    {"status": "pending_approval", "pending": [...], "messages": [...]}
+    {"status": "stuck", "message": {...}, "messages": [...]}
+    """
     messages = list(messages)
     tool_defs = build_tool_defs()
     approvals = approvals or {}
@@ -74,6 +137,16 @@ def run_agent(
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
             approvals = {}
+
+            signatures = _extract_round_signatures(messages)
+            if len(signatures) >= 2 and signatures[-1] == signatures[-2]:
+                note = (
+                    "I ran the same action and got the same result two rounds in a row, "
+                    "so I'm stopping here instead of repeating it again - this needs a "
+                    "different approach or a closer look."
+                )
+                return {"status": "stuck", "message": {"role": "assistant", "content": note}, "messages": messages}
+
             continue
 
         raw = model_runtime.create_chat_completion(

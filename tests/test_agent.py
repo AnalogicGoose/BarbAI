@@ -197,3 +197,96 @@ def test_read_file_not_gated_runs_without_approval(monkeypatch):
     result = run_agent(llm=object(), messages=[{"role": "user", "content": "hi"}], max_iterations=10)
     assert result["status"] == "final"
     assert result["message"]["content"] == "Read it, here's the answer."
+
+
+def test_stuck_detection_stops_on_repeated_identical_round(monkeypatch):
+    calls = [
+        _raw(None, tool_calls=[_tool_call("call_1", "read_file", {"path": "x.txt"})], finish_reason="tool_calls"),
+        _raw(None, tool_calls=[_tool_call("call_2", "read_file", {"path": "x.txt"})], finish_reason="tool_calls"),
+        _raw("should never be reached"),
+    ]
+    call_iter = iter(calls)
+    monkeypatch.setattr(
+        "barbai.core.agent.model_runtime.create_chat_completion",
+        lambda llm, **kwargs: next(call_iter),
+    )
+    monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "same result every time")
+
+    result = run_agent(llm=object(), messages=[{"role": "user", "content": "hi"}], max_iterations=20)
+    assert result["status"] == "stuck"
+    assert "same" in result["message"]["content"].lower()
+
+
+def test_stuck_detection_ignores_different_arguments(monkeypatch):
+    calls = [
+        _raw(None, tool_calls=[_tool_call("call_1", "read_file", {"path": "a.txt"})], finish_reason="tool_calls"),
+        _raw(None, tool_calls=[_tool_call("call_2", "read_file", {"path": "b.txt"})], finish_reason="tool_calls"),
+        _raw("Got both files."),
+    ]
+    call_iter = iter(calls)
+    monkeypatch.setattr(
+        "barbai.core.agent.model_runtime.create_chat_completion",
+        lambda llm, **kwargs: next(call_iter),
+    )
+    monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "same content")
+
+    result = run_agent(llm=object(), messages=[{"role": "user", "content": "hi"}], max_iterations=20)
+    assert result["status"] == "final"
+    assert result["message"]["content"] == "Got both files."
+
+
+def test_stuck_detection_ignores_different_results(monkeypatch):
+    calls = [
+        _raw(None, tool_calls=[_tool_call("call_1", "read_file", {"path": "x.txt"})], finish_reason="tool_calls"),
+        _raw(None, tool_calls=[_tool_call("call_2", "read_file", {"path": "x.txt"})], finish_reason="tool_calls"),
+        _raw("Done."),
+    ]
+    call_iter = iter(calls)
+    monkeypatch.setattr(
+        "barbai.core.agent.model_runtime.create_chat_completion",
+        lambda llm, **kwargs: next(call_iter),
+    )
+    results = iter(["first result", "second result"])
+    monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: next(results))
+
+    result = run_agent(llm=object(), messages=[{"role": "user", "content": "hi"}], max_iterations=20)
+    assert result["status"] == "final"
+
+
+def test_stuck_detection_across_resume_with_repeated_denial(monkeypatch):
+    calls = [
+        _raw(
+            None,
+            tool_calls=[_tool_call("call_w1", "write_file", {"path": "out.txt", "content": "hi"})],
+            finish_reason="tool_calls",
+        ),
+        _raw(
+            None,
+            tool_calls=[_tool_call("call_w2", "write_file", {"path": "out.txt", "content": "hi"})],
+            finish_reason="tool_calls",
+        ),
+        _raw("should never be reached"),
+    ]
+    call_iter = iter(calls)
+    monkeypatch.setattr(
+        "barbai.core.agent.model_runtime.create_chat_completion",
+        lambda llm, **kwargs: next(call_iter),
+    )
+
+    def unexpected_execute(name, arguments):
+        raise AssertionError("a denied call must never execute")
+
+    monkeypatch.setattr("barbai.core.agent.execute_tool", unexpected_execute)
+
+    paused1 = run_agent(llm=object(), messages=[{"role": "user", "content": "write a file"}], max_iterations=20)
+    assert paused1["status"] == "pending_approval"
+
+    resumed1 = run_agent(
+        llm=object(), messages=paused1["messages"], approvals={"call_w1": False}, max_iterations=20
+    )
+    assert resumed1["status"] == "pending_approval"
+
+    resumed2 = run_agent(
+        llm=object(), messages=resumed1["messages"], approvals={"call_w2": False}, max_iterations=20
+    )
+    assert resumed2["status"] == "stuck"

@@ -28,8 +28,11 @@ approval step) — opt-in per-conversation session memory, and an explicit-only
 global memory that persists across every conversation are all built and
 tested. Phase 2.1's other two target laptops (3050, 5070 Ti) still need
 real hardware to verify against. Coding mode is planned in sub-phases
-(see `docs/CODING_AGENT_ROADMAP.md`, Phase 3.1 now done — full tool
-suite); the mode-switching mechanism itself
+(see `docs/CODING_AGENT_ROADMAP.md`; Phase 3.1's full tool suite and
+Phase 3.2's stuck-loop detection are both done — the agent loop now
+stops itself with a clear explanation if it repeats the same action and
+gets the same result twice in a row, instead of burning its iteration
+budget on a dead end); the mode-switching mechanism itself
 (`/agent/chat`'s `mode` field, a Coding-specific persona) is built and
 tested. No dedicated coding model — decided, not just unfinished: the
 obvious pick (Qwen2.5-Coder-7B) is the model this project already found

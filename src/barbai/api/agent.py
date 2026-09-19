@@ -4,8 +4,12 @@ BarbAI's own agentic endpoint - runs the tool-execution loop server-side.
 Unlike /v1/chat/completions, /chat, and /v1/messages (which hand a
 tool_call back to the caller and stop - correct behavior for OpenAI/
 Anthropic compat, where the caller runs its own tools), this endpoint
-executes tools itself and only returns once the model has a final answer
-or a gated tool call (write_file) needs human approval.
+executes tools itself and returns once the model has a final answer, a
+gated tool call needs human approval, or (Phase 3.2) the loop detects
+it's stuck - the same tool call producing the same result two rounds in
+a row - and stops on its own rather than burning the rest of its
+iteration budget repeating a dead end. See core.agent's module docstring
+for the stuck-detection logic itself.
 
 Phase 3.0: this is the one mode-aware endpoint. `mode` ("general" or
 "coding", default "general") picks the model and persona via
@@ -108,6 +112,13 @@ def agent_chat(request: AgentChatRequest):
         if message.get("content") is not None:
             to_persist.append({"role": "assistant", "content": message["content"]})
         memory.append_to_session(request.session_id, to_persist)
+
+    if result["status"] == "stuck":
+        return {
+            "status": "stuck",
+            "reply": message.get("content"),
+            "conversation": result["messages"],
+        }
 
     return {
         "status": "final",
