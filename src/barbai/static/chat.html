@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BarbAI (temp chat)</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 1rem;
+    background: #1a1a1a;
+    color: #e8e8e8;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  h1 { font-size: 1rem; color: #888; font-weight: normal; margin: 0 0 0.75rem; }
+  #controls { display: flex; gap: 1rem; margin-bottom: 0.75rem; font-size: 0.85rem; color: #aaa; align-items: center; }
+  #log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.6rem; padding-bottom: 1rem; }
+  .msg { padding: 0.55rem 0.85rem; border-radius: 10px; max-width: 85%; white-space: pre-wrap; word-wrap: break-word; line-height: 1.4; }
+  .user { align-self: flex-end; background: #2b5797; }
+  .assistant { align-self: flex-start; background: #333; }
+  .system-note { align-self: center; background: transparent; color: #886; font-size: 0.8rem; font-style: italic; }
+  .approval { align-self: stretch; background: #3a2f10; border: 1px solid #a87c1f; padding: 0.75rem; border-radius: 10px; }
+  .approval .title { font-weight: 600; margin-bottom: 0.4rem; color: #e0b04d; }
+  .approval pre { white-space: pre-wrap; word-wrap: break-word; background: #201a08; padding: 0.5rem; border-radius: 6px; overflow-x: auto; margin: 0.3rem 0; font-size: 0.85rem; }
+  .approval .buttons { margin-top: 0.5rem; }
+  .approval button { margin-right: 0.5rem; padding: 0.4rem 1rem; cursor: pointer; border: none; border-radius: 6px; font-size: 0.9rem; }
+  .approve { background: #2a8a4a; color: #fff; }
+  .deny { background: #a33333; color: #fff; }
+  #inputRow { display: flex; gap: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #333; }
+  textarea { flex: 1; resize: none; min-height: 2.6rem; max-height: 8rem; background: #222; color: #eee; border: 1px solid #555; border-radius: 8px; padding: 0.55rem 0.7rem; font-family: inherit; font-size: 0.95rem; }
+  button#send { padding: 0 1.3rem; border-radius: 8px; border: none; background: #2b5797; color: #fff; cursor: pointer; font-size: 0.95rem; }
+  button#send:disabled { opacity: 0.5; cursor: default; }
+  select { background: #222; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 0.15rem 0.3rem; }
+</style>
+</head>
+<body>
+<h1>BarbAI — temp chat. Talks to /agent/chat; not the real UI (see docs/PACKAGING_ROADMAP.md Phase 4.0).</h1>
+<div id="controls">
+  <label>mode <select id="mode"><option value="general">general</option><option value="coding">coding</option></select></label>
+  <label>thinking <select id="thinking"><option value="thinking" selected>thinking</option><option value="fast">fast</option><option value="extended">extended</option></select></label>
+  <span id="sessionLabel"></span>
+</div>
+<div id="log"></div>
+<div id="inputRow">
+  <textarea id="input" placeholder="Message BarbAI... (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send">Send</button>
+</div>
+
+<script>
+const log = document.getElementById('log');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const modeSel = document.getElementById('mode');
+const thinkingSel = document.getElementById('thinking');
+const sessionId = 'temp-ui-' + Math.random().toString(36).slice(2, 10);
+document.getElementById('sessionLabel').textContent = 'session: ' + sessionId + ' (this tab only)';
+
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  log.appendChild(div);
+  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+  return div;
+}
+
+function addSystemNote(text) {
+  const div = document.createElement('div');
+  div.className = 'msg system-note';
+  div.textContent = text;
+  log.appendChild(div);
+  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+}
+
+async function callAgent(body) {
+  const resp = await fetch('/agent/chat', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) { detail = await resp.text(); }
+    throw new Error(`HTTP ${resp.status}${detail ? ': ' + detail : ''}`);
+  }
+  return resp.json();
+}
+
+function renderApproval(result) {
+  const div = document.createElement('div');
+  div.className = 'approval';
+
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = 'BarbAI wants to run this - review before it does:';
+  div.appendChild(title);
+
+  result.pending.forEach(call => {
+    const pre = document.createElement('pre');
+    pre.textContent = call.name + '(' + JSON.stringify(call.arguments, null, 2) + ')';
+    div.appendChild(pre);
+  });
+
+  const buttons = document.createElement('div');
+  buttons.className = 'buttons';
+  const approveBtn = document.createElement('button');
+  approveBtn.textContent = 'Approve';
+  approveBtn.className = 'approve';
+  const denyBtn = document.createElement('button');
+  denyBtn.textContent = 'Deny';
+  denyBtn.className = 'deny';
+
+  const resolve = async (value) => {
+    approveBtn.disabled = true;
+    denyBtn.disabled = true;
+    try {
+      const approvals = {};
+      result.pending.forEach(call => { approvals[call.id] = value; });
+      const next = await callAgent({conversation: result.conversation, approvals});
+      await handleAgentResponse(next);
+    } catch (err) {
+      addSystemNote('Error resuming: ' + err.message);
+    }
+  };
+
+  approveBtn.onclick = () => resolve(true);
+  denyBtn.onclick = () => resolve(false);
+  buttons.appendChild(approveBtn);
+  buttons.appendChild(denyBtn);
+  div.appendChild(buttons);
+
+  log.appendChild(div);
+  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+}
+
+async function handleAgentResponse(result) {
+  if (result.status === 'pending_approval') {
+    renderApproval(result);
+  } else if (result.status === 'final') {
+    addMsg('assistant', result.reply || '(empty reply)');
+  } else if (result.status === 'stuck') {
+    addMsg('assistant', result.reply || '(stuck)');
+    addSystemNote('BarbAI stopped itself - repeated the same action with the same result twice in a row.');
+  } else {
+    addSystemNote('Unexpected response: ' + JSON.stringify(result));
+  }
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+  addMsg('user', text);
+
+  try {
+    const result = await callAgent({
+      messages: [{role: 'user', content: text}],
+      session_id: sessionId,
+      mode: modeSel.value,
+      thinking: thinkingSel.value,
+    });
+    await handleAgentResponse(result);
+  } catch (err) {
+    addSystemNote('Error: ' + err.message);
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+sendBtn.onclick = send;
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 128) + 'px';
+});
+
+addSystemNote('Ready. Gated actions (write_file, patch_file, run_command, remember) will show an approve/deny card before running.');
+input.focus();
+</script>
+</body>
+</html>

@@ -98,7 +98,13 @@ whole feature can be switched off with `BARBAI_GLOBAL_MEMORY=off`. Like
 `write_file`, `remember` is gated: it pauses for approval before the fact
 is actually stored.
 
-Easiest way to try any of them: start the server, then open
+Easiest way to try `/agent/chat` specifically: start the server, then open
+`http://127.0.0.1:8000/` for a small built-in chat page — message
+history, mode/thinking selectors, and approve/deny cards for gated tool
+calls. This is a throwaway placeholder (`src/barbai/static/chat.html`),
+not the real bundled frontend `docs/PACKAGING_ROADMAP.md` Phase 4.0
+describes — good enough to actually use the agent loop without `curl`.
+For the other endpoints, or the wire formats themselves, open
 `http://127.0.0.1:8000/docs` for FastAPI's interactive Swagger UI.
 
 ## Requirements
