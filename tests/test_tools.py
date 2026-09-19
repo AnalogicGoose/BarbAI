@@ -1,5 +1,7 @@
 import os
 import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -12,6 +14,7 @@ from barbai.core.tools import (
     patch_file,
     read_file,
     remember,
+    run_command,
     search,
     write_file,
 )
@@ -504,3 +507,99 @@ def test_write_file_new_file_uses_lf(workspace):
     result = (workspace / "brand_new.txt").read_bytes()
     assert result == b"line1\nline2"
     assert b"\r" not in result
+
+
+# --- run_command ---
+# Uses sys.executable (python -c "...") for anything that needs to be
+# portable across shells, rather than assuming POSIX-only builtins.
+
+
+def test_run_command_captures_stdout_and_exit_code(workspace):
+    result = run_command(f'{sys.executable} -c "print(\'hello\')"')
+    assert "exit code: 0" in result
+    assert "hello" in result
+
+
+def test_run_command_nonzero_exit_is_not_an_error(workspace):
+    result = run_command(f'{sys.executable} -c "import sys; sys.exit(1)"')
+    assert "exit code: 1" in result
+
+
+def test_run_command_captures_stderr_too(workspace):
+    result = run_command(f'{sys.executable} -c "import sys; sys.stderr.write(\'oops\')"')
+    assert "oops" in result
+
+
+def test_run_command_runs_in_default_cwd(workspace):
+    result = run_command(f'{sys.executable} -c "import os; print(os.getcwd())"')
+    assert str(workspace.resolve()) in result
+
+
+def test_run_command_respects_explicit_cwd(workspace):
+    cmd_dir = workspace / "cmd_subdir"
+    cmd_dir.mkdir()
+    result = run_command(f'{sys.executable} -c "import os; print(os.getcwd())"', cwd="cmd_subdir")
+    assert str(cmd_dir.resolve()) in result
+
+
+def test_run_command_cwd_outside_allowlist_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        run_command("echo hi", cwd=str(workspace.parent))
+
+
+def test_run_command_cwd_not_a_directory_rejected(workspace):
+    (workspace / "afile.txt").write_text("x")
+    with pytest.raises(ToolExecutionError):
+        run_command("echo hi", cwd="afile.txt")
+
+
+def test_run_command_empty_command_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        run_command("   ")
+
+
+def test_run_command_timeout(workspace):
+    with pytest.raises(ToolExecutionError):
+        run_command(f'{sys.executable} -c "import time; time.sleep(5)"', timeout_seconds=1)
+
+
+def test_run_command_timeout_includes_partial_output(workspace):
+    script = "import sys, time; print('before'); sys.stdout.flush(); time.sleep(5)"
+    with pytest.raises(ToolExecutionError, match="before"):
+        run_command(f'{sys.executable} -c "{script}"', timeout_seconds=1)
+
+
+def test_run_command_negative_timeout_rejected(workspace):
+    with pytest.raises(ToolExecutionError):
+        run_command("echo hi", timeout_seconds=-1)
+
+
+def test_run_command_timeout_is_capped(workspace, monkeypatch):
+    calls = {}
+
+    def fake_run(invocation, **kwargs):
+        calls["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(cmd=invocation, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr("barbai.core.tools.subprocess.run", fake_run)
+    with pytest.raises(ToolExecutionError):
+        run_command("echo hi", timeout_seconds=99999)
+    assert calls["timeout"] == 600
+
+
+def test_run_command_output_is_truncated(workspace):
+    script = "print('x' * 50000)"
+    result = run_command(f'{sys.executable} -c "{script}"')
+    assert "truncated" in result
+    assert len(result) < 50000
+
+
+def test_run_command_is_gated():
+    assert "run_command" in GATED_TOOLS
+
+
+def test_run_command_nonexistent_binary_is_a_nonzero_exit_not_a_tool_error(workspace):
+    # Goes through a real shell (sh -c / cmd /c), so "command not found"
+    # is the shell's own nonzero-exit output, not a Python-level OSError.
+    result = run_command("this_binary_definitely_does_not_exist_xyz123")
+    assert "exit code: 0" not in result

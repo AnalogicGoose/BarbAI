@@ -34,12 +34,30 @@ whatever the host OS prefers - that would otherwise mean editing a single
 line of a Windows-authored file on a Linux server rewrites every line
 ending in it. A brand-new file just gets \n, the portable default every
 OS's tooling handles fine. See _detect_newline.
+
+run_command's design was checked against how OpenAI Codex, GitHub
+Copilot, and Claude Code's own Bash tool handle this before building it.
+Codex and Copilot both do real OS-level sandboxing (macOS seatbelt,
+Windows native sandbox, deny-by-default network) - a genuine engineering
+undertaking per platform, and explicitly Phase 3.3 territory here
+(command sanitization is already deferred there), not this first pass.
+Claude Code's own Bash tool is the closer model for where this project
+is right now: no kernel sandbox, relies on approval + sane limits -
+its numbers (2min default timeout, 10min cap, 30,000-char output cap
+with *middle* truncation - keep the start and end, cut the middle, since
+errors are usually at the end and setup context at the start) are
+adopted directly here as proven defaults. Its persistent shell session
+and background-execution support are deliberately NOT adopted yet -
+both add real state across calls that doesn't fit this project's
+stateless-per-call tool model without its own design pass; each
+run_command call is a fresh subprocess, cwd passed explicitly every time.
 """
 
 from __future__ import annotations
 
 import itertools
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,8 +69,11 @@ MAX_WRITE_BYTES = 1_000_000
 MAX_REMEMBER_CHARS = 500
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
+DEFAULT_COMMAND_TIMEOUT = 120  # seconds - same default Claude Code's own Bash tool uses
+MAX_COMMAND_TIMEOUT = 600  # seconds - same cap Claude Code's own Bash tool uses
+MAX_COMMAND_OUTPUT_CHARS = 30_000  # same limit Claude Code's own Bash tool uses
 
-GATED_TOOLS = {"write_file", "remember", "patch_file"}
+GATED_TOOLS = {"write_file", "remember", "patch_file", "run_command"}
 
 _NOISE_DIR_NAMES = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
@@ -128,6 +149,26 @@ def _describe_roots(roots: list[Path]) -> str:
         kind = "file" if root.is_file() else "directory"
         parts.append(f"{root} ({kind})")
     return "; ".join(parts)
+
+def _shell_invocation(command: str) -> list[str]:
+    """Wrap a command string for the platform's real shell. On Windows,
+    cmd.exe (always present, no WSL/PowerShell assumption). On Unix,
+    the user's actual $SHELL (bash/zsh, not just /bin/sh) so bashisms in
+    a command behave the way they would in the user's own terminal -
+    same reasoning Claude Code's own Bash tool sources ~/.bashrc for."""
+    if platform.system() == "Windows":
+        return ["cmd", "/c", command]
+    return [os.environ.get("SHELL", "/bin/sh"), "-c", command]
+
+def _truncate_output(output: str, limit: int = MAX_COMMAND_OUTPUT_CHARS) -> str:
+    """Middle-truncate rather than cut the tail: command errors are
+    usually at the end of the output, setup/context at the start -
+    losing the middle is the least harmful place to cut."""
+    if len(output) <= limit:
+        return output
+    marker = "\n... [truncated] ...\n"
+    half = (limit - len(marker)) // 2
+    return output[:half] + marker + output[-half:]
 
 def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
     roots = _workspace_roots()
@@ -277,6 +318,57 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
         f.write(on_disk)
 
     return f"replaced {replaced} occurrence{'s' if replaced != 1 else ''} in {path}"
+
+def run_command(command: str, cwd: str | None = None, timeout_seconds: int | None = None) -> str:
+    """Run a shell command - the tool that actually lets the agent verify
+    its own work (run tests/build), not just read and edit code. No
+    sandbox and no command sanitization yet (both explicitly deferred to
+    Phase 3.3, see module docstring) - the approval gate, the working-dir
+    allowlist, the timeout, and the output cap are the whole safety
+    boundary for this first pass. A nonzero exit code is normal, useful
+    information (a failing test), not a tool failure - it's returned,
+    never raised; only things that mean the command genuinely couldn't
+    be evaluated (bad cwd, timeout, no such shell) raise."""
+    roots = _workspace_roots()
+
+    if cwd is not None:
+        candidate = _resolve_path(cwd, roots)
+        if candidate is None:
+            raise ToolExecutionError(f"path {cwd!r} is outside every allowed location")
+        if not candidate.is_dir():
+            raise ToolExecutionError(f"not a directory: {cwd!r}")
+    else:
+        directory_roots = [r for r in roots if r.is_dir()]
+        if not directory_roots:
+            raise ToolExecutionError("no directory in the allowlist to run a command from - pass cwd explicitly")
+        candidate = directory_roots[0]
+
+    if not command.strip():
+        raise ToolExecutionError("command cannot be empty")
+
+    timeout = timeout_seconds if timeout_seconds is not None else DEFAULT_COMMAND_TIMEOUT
+    if timeout <= 0:
+        raise ToolExecutionError(f"timeout_seconds must be positive, got {timeout_seconds}")
+    timeout = min(timeout, MAX_COMMAND_TIMEOUT)
+
+    try:
+        proc = subprocess.run(
+            _shell_invocation(command),
+            cwd=str(candidate),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        raise ToolExecutionError(
+            f"command timed out after {timeout}s in {candidate}. Partial output:\n{_truncate_output(partial)}"
+        ) from None
+    except OSError as exc:
+        raise ToolExecutionError(f"couldn't run command: {exc}") from None
+
+    return f"exit code: {proc.returncode}\n\n{_truncate_output(proc.stdout or '')}"
 
 def remember(text: str) -> str:
     if not global_memory.is_enabled():
@@ -481,6 +573,51 @@ def patch_file_tool_def() -> dict:
         },
     }
 
+def run_command_tool_def() -> dict:
+    roots = _workspace_roots()
+    directory_roots = [r for r in roots if r.is_dir()]
+    default_cwd = str(directory_roots[0]) if directory_roots else "none configured"
+    return {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run a shell command (e.g. running tests, a build, a "
+                "linter) and get back its exit code and output - this is "
+                "how you verify a change actually works, not just that it "
+                "looks right. Allowed working directories: "
+                f"{_describe_roots(roots)}. Defaults to {default_cwd} if "
+                "cwd is omitted. Output over "
+                f"{MAX_COMMAND_OUTPUT_CHARS} characters is truncated in "
+                "the middle (start and end are kept). Requires human "
+                "approval before it actually runs. A nonzero exit code "
+                "just means the command failed (e.g. a test failed) - "
+                "that's useful information, not an error to give up on."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run, exactly as you'd type it in a terminal.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory to run the command from. Must be one of the allowed locations. Omit to use the default.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": (
+                            f"Max time to let the command run, in seconds. Default {DEFAULT_COMMAND_TIMEOUT}, "
+                            f"capped at {MAX_COMMAND_TIMEOUT}."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    }
+
 def remember_tool_def() -> dict:
     return {
         "type": "function",
@@ -581,6 +718,7 @@ TOOLS = {
     "read_file": read_file,
     "write_file": write_file,
     "patch_file": patch_file,
+    "run_command": run_command,
     "remember": remember,
     "list_directory": list_directory,
     "search": search,
@@ -591,6 +729,7 @@ def build_tool_defs() -> list[dict]:
         read_file_tool_def(),
         write_file_tool_def(),
         patch_file_tool_def(),
+        run_command_tool_def(),
         list_directory_tool_def(),
         search_tool_def(),
     ]

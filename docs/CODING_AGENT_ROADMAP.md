@@ -123,7 +123,7 @@ this piece landing first.
     Claude Code precedent (which shares nothing with claude.ai's memory)
     — the divergence is intentional, not an oversight.
 
-### Phase 3.1 — Expanded local tool suite — read-only half done
+### Phase 3.1 — Expanded local tool suite — done
 `read_file`/`write_file` are whole-file only and capped at 100KB/1MB —
 fine for a general assistant, not enough for real repo work. New tools,
 all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
@@ -171,11 +171,37 @@ all scoped to the existing `BARBAI_TOOLS_ROOTS` allowlist pattern:
     `patch_file`, approved the gated call, and confirmed byte-for-byte
     that every remaining line ending stayed `\r\n` - only the intended
     line changed.
-- `run_command` — a real shell/PTY tool (`npm run build`, `pytest`, ...).
-  **Gated.** Scoped to a working-directory allowlist (mirror
-  `BARBAI_TOOLS_ROOTS`), with a timeout and an output-size cap. Command
-  sanitization is Phase 3.3, not this phase — land the tool restricted
-  and inert-by-default (approval-gated) before hardening it further.
+- **Done.** `run_command` (`core/tools.py`) — a real shell tool (`pytest`,
+  `npm run build`, ...). **Gated.** Working directory must resolve
+  within the same `BARBAI_TOOLS_ROOTS` allowlist file tools use (no
+  separate allowlist). Design checked against OpenAI Codex, GitHub
+  Copilot, and Claude Code's own Bash tool before building (see
+  `core/tools.py` module docstring for the full comparison): Codex and
+  Copilot both do real OS-level sandboxing (macOS seatbelt, Windows
+  native sandbox) - explicitly Phase 3.3 territory, not this pass, since
+  command sanitization is already deferred there. Claude Code's own Bash
+  tool is the closer model for where this project is now - its proven
+  numbers were adopted directly: 120s default timeout (600s cap, same as
+  Claude Code's 2min/10min), and a 30,000-character output cap with
+  *middle* truncation (keep the start and end, cut the middle - errors
+  are usually at the end, setup context at the start). Its persistent
+  shell session and background-execution support were deliberately
+  **not** adopted - both add real state across calls that doesn't fit
+  this project's stateless-per-call tool model without their own design
+  pass; every `run_command` call is a fresh subprocess, `cwd` passed
+  explicitly each time. A nonzero exit code is normal output (a failing
+  test), never raised as an error - only things that mean the command
+  genuinely couldn't be evaluated (bad `cwd`, timeout, no such shell) do.
+  - **Verified live, full loop, not just unit tests:** gave the running
+    model a file with a deliberately broken function and a failing test,
+    and one instruction ("run the tests, fix what's broken, verify it
+    passes"). Unprompted structurally, it ran `run_command` (test
+    failed) → `read_file` → `patch_file` (fixed the actual bug) →
+    `run_command` again (confirmed the fix), all through the approval
+    gate, and correctly summarized what was wrong. The file on disk was
+    genuinely fixed. This is Phase 3.2's Observe-Think-Act-Verify loop
+    already happening with the current tool set, even before that phase
+    formally builds the scaffolding to make it reliable/automatic.
 
 ### Phase 3.2 — The Observe-Think-Act-Verify loop
 The existing `run_agent` loop is "call tool → get result → continue

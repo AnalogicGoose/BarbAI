@@ -19,16 +19,17 @@ web UI lives in [`docs/PACKAGING_ROADMAP.md`](docs/PACKAGING_ROADMAP.md).
 Phase 2.0 (core loop), most of Phase 2.2 (tool calling), and Phase 2.3
 (memory) are done — see the roadmap doc for the detailed breakdown. In
 short: model loading, hardware-tier detection, streaming, tool calling, a
-server-side agent loop with six tools — `read_file` (whole-file or a
+server-side agent loop with seven tools — `read_file` (whole-file or a
 line range), `list_directory`, and `search` (all three ungated, routine
 reads), plus `write_file`, `patch_file` (exact-string search/replace,
-cross-platform line-ending-safe), and `remember` (all three gated behind
-a human approval step) — opt-in per-conversation session memory, and an explicit-only
+cross-platform line-ending-safe), `run_command` (a real shell tool —
+tests, builds, whatever), and `remember` (all four gated behind a human
+approval step) — opt-in per-conversation session memory, and an explicit-only
 global memory that persists across every conversation are all built and
 tested. Phase 2.1's other two target laptops (3050, 5070 Ti) still need
 real hardware to verify against. Coding mode is planned in sub-phases
-(see `docs/CODING_AGENT_ROADMAP.md`, Phase 3.1 partly done — the
-read-only tool half); the mode-switching mechanism itself
+(see `docs/CODING_AGENT_ROADMAP.md`, Phase 3.1 now done — full tool
+suite); the mode-switching mechanism itself
 (`/agent/chat`'s `mode` field, a Coding-specific persona) is built and
 tested. No dedicated coding model — decided, not just unfinished: the
 obvious pick (Qwen2.5-Coder-7B) is the model this project already found
