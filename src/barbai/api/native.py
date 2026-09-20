@@ -135,11 +135,27 @@ def chat(request: NativeChatRequest):
     messages = [
         {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
     ] + history + new_messages
+    # A long session_id conversation can grow past the context window on
+    # its own (see core.model_runtime.fit_to_context's docstring for why
+    # this matters - a real crash, not a hypothetical). The streaming
+    # path can still fail mid-stream if this estimate runs short, since
+    # headers are already sent by the time llama.cpp would raise - a much
+    # rarer residual case now than an unguarded call, not eliminated.
+    messages = model_runtime.fit_to_context(llm, messages)
 
     if request.stream:
         return StreamingResponse(_stream_chat(llm, messages, **kwargs), media_type="text/event-stream")
 
-    raw = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), **kwargs)
+    try:
+        raw = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), **kwargs)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"conversation is too long for the current context window even after trimming ({exc}) - "
+                "start a new session or raise BARBAI_N_CTX"
+            ),
+        ) from exc
 
     try:
         message = to_openai_message(raw["choices"][0]["message"])

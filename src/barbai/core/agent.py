@@ -48,6 +48,14 @@ special scaffolding (see docs/CODING_AGENT_ROADMAP.md Phase 3.1). The
 loop already exhibits Observe-Think-Act-Verify emergently; what it
 lacked was a way to recognize when that process stalls, which is what
 this phase actually adds.
+
+Every model call trims `messages` to fit the context window first
+(model_runtime.fit_to_context) - a long session_id conversation or a
+tool-heavy loop can grow past n_ctx, and without this the loop crashed
+with a bare ValueError surfaced as a raw 500, a real crash a user hit
+in practice, not a hypothetical. Only the copy sent to the model is
+trimmed; `messages` itself keeps the full history for the return value
+and session persistence.
 """
 
 from __future__ import annotations
@@ -149,9 +157,23 @@ def run_agent(
 
             continue
 
-        raw = model_runtime.create_chat_completion(
-            llm, messages=messages, tools=tool_defs, thinking_mode=thinking_mode
-        )
+        # Trim only the copy sent to the model - messages itself keeps
+        # accumulating in full and is what gets returned/persisted, so
+        # what counts as "still relevant" is re-decided fresh next round
+        # rather than permanently discarded from the record on disk.
+        # fit_to_context itself can raise (context too small to leave any
+        # room for a response at all) - same clean-error treatment as an
+        # overflow surfacing from the actual model call below.
+        try:
+            trimmed_messages = model_runtime.fit_to_context(llm, messages)
+            raw = model_runtime.create_chat_completion(
+                llm, messages=trimmed_messages, tools=tool_defs, thinking_mode=thinking_mode
+            )
+        except ValueError as exc:
+            raise AgentError(
+                f"conversation is too long for the current context window even after trimming ({exc}) - "
+                "start a new session or raise BARBAI_N_CTX"
+            ) from exc
         try:
             message = to_openai_message(raw["choices"][0]["message"])
         except UnrecognizedToolCallFormatError as exc:

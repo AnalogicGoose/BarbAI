@@ -35,6 +35,16 @@ actual conversation happens, easily past 4096 tokens on its own. Raising
 this uses more VRAM for the KV cache - there's no automatic check that a
 larger value still fits the current tier, the caller is trusted to know
 what they asked for.
+
+fit_to_context() is the other half of that same problem: a long
+session_id conversation, or a tool-heavy agent loop, can grow past
+n_ctx too, and llama.cpp's own response to that is a bare ValueError
+that reached the client as a raw 500 - a real crash a user hit in
+practice, not a hypothetical. "Start dumb" here means drop the oldest
+turns once the running total doesn't fit, not summarize them - the same
+explicit-first, summarize-later call already made for global memory
+(docs/BARBAI_ROADMAP.md Phase 2.3); revisit only once dropping instead
+of summarizing is actually felt as a real loss, not preemptively.
 """
 
 from __future__ import annotations
@@ -127,6 +137,57 @@ def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int | None = None) -> 
 
 THINKING_MODES = ("fast", "thinking", "extended")
 _EXTENDED_MIN_MAX_TOKENS = 1500
+
+DEFAULT_RESERVED_FOR_RESPONSE = 512  # tokens left free for the model's own reply
+_TOKENS_PER_MESSAGE_OVERHEAD = 8  # rough allowance for chat-template role/separator tokens per message
+
+def count_tokens(llm: Llama, messages: list[dict]) -> int:
+    """Estimate the token count for a list of chat messages, using the
+    loaded model's own tokenizer. Not exact - this sums each message's
+    raw content tokens plus a fixed per-message overhead, rather than
+    rendering the actual chat template (system prompt wrapper, role
+    tags, tool-call formatting) - but fit_to_context() reserves real
+    headroom for the response on top of this, so being an
+    underestimate by a modest margin is safe, not a correctness bug."""
+    total = 0
+    for m in messages:
+        content = m.get("content") or ""
+        if content:
+            total += len(llm.tokenize(content.encode("utf-8"), add_bos=False))
+        total += _TOKENS_PER_MESSAGE_OVERHEAD
+    return total
+
+def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int = DEFAULT_RESERVED_FOR_RESPONSE) -> list[dict]:
+    """Drop the oldest messages - after any leading system message, and
+    never the newest message - until what's left fits the model's
+    actual context window with room left over for the response too.
+
+    This is what stops a long conversation (session_id replay, or a
+    tool-heavy agent loop accumulating read_file/search results) from
+    crashing with llama.cpp's bare "Requested tokens (N) exceed context
+    window of M" ValueError instead of just quietly forgetting the
+    oldest, least-relevant part of the conversation - the same idea a
+    hosted assistant's context window uses, just by dropping instead of
+    summarizing (see module docstring for why that's the deliberate
+    "start dumb" scope for now).
+    """
+    if not messages:
+        return messages
+
+    budget = llm.n_ctx() - reserved_for_response
+    if budget <= 0:
+        raise ValueError(
+            f"context window ({llm.n_ctx()}) is too small to leave {reserved_for_response} tokens for a response"
+        )
+
+    has_system = messages[0].get("role") == "system"
+    protected_head = 1 if has_system else 0
+
+    trimmed = list(messages)
+    while len(trimmed) > protected_head + 1 and count_tokens(llm, trimmed) > budget:
+        del trimmed[protected_head]
+
+    return trimmed
 
 def _resolve_chat_handler(llm: Llama):
     """Get the callable llama-cpp-python actually uses to run a chat

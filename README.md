@@ -62,6 +62,13 @@ All support `"stream": true` (SSE) except `/agent/chat`. All accept an
 optional `"thinking": "fast" | "thinking" | "extended"` field (default
 `"thinking"`).
 
+`/chat` and `/agent/chat` both automatically trim the oldest messages
+(after the system prompt, and never the newest one) if the conversation
+grows past the context window, instead of crashing — a long `session_id`
+conversation, or a tool-heavy agent loop, doesn't need to be babysat.
+Nothing is summarized, just dropped; raise `BARBAI_N_CTX` if you want
+longer conversations before that kicks in.
+
 `/agent/chat` can pause mid-loop: if the model requests a gated tool call
 (currently `write_file` or `remember`), the response comes back as
 `{"status": "pending_approval", "pending": [...], "conversation": [...]}`
