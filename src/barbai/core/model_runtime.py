@@ -40,6 +40,7 @@ what they asked for.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from llama_cpp import Llama
@@ -51,6 +52,14 @@ MODES = ("general", "coding")
 
 _model: Llama | None = None
 _current_mode: str | None = None
+# Guards ensure_mode()'s check-then-load: FastAPI runs sync endpoints in a
+# threadpool, so two /agent/chat requests arriving close together (e.g. a
+# page refresh while the first request's model load is still in flight)
+# could otherwise both see _model as None/wrong-mode and both call
+# load_model() concurrently - two simultaneous ~5GB CUDA allocations can
+# fail with "out of memory" even when free VRAM has room for one of them
+# alone. Not held during ordinary get_model() reads, only the load path.
+_load_lock = threading.Lock()
 
 def _model_path_for_mode(mode: str) -> Path:
     if mode == "coding":
@@ -103,13 +112,18 @@ def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int | None = None) -> 
     """Return the model for `mode`, loading or switching only if needed.
 
     A call for the mode that's already active reuses the loaded model
-    instead of paying for a full GGUF reload.
+    instead of paying for a full GGUF reload. Locked (see _load_lock) so
+    two concurrent callers can't both decide a load is needed and both
+    try to allocate a GPU buffer at once - the second caller blocks,
+    then either reuses what the first one just loaded or loads in turn,
+    never in parallel.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
-    if _model is not None and _current_mode == mode:
-        return _model
-    return load_model(n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, mode=mode)
+    with _load_lock:
+        if _model is not None and _current_mode == mode:
+            return _model
+        return load_model(n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, mode=mode)
 
 THINKING_MODES = ("fast", "thinking", "extended")
 _EXTENDED_MIN_MAX_TOKENS = 1500

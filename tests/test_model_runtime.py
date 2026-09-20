@@ -143,3 +143,48 @@ def test_resolve_n_ctx_rejects_non_integer(monkeypatch):
     monkeypatch.setenv("BARBAI_N_CTX", "not-a-number")
     with pytest.raises(ValueError):
         model_runtime._resolve_n_ctx(None)
+
+
+def test_ensure_mode_is_locked_against_concurrent_loads(monkeypatch):
+    """Regression test: two /agent/chat requests arriving close together,
+    both seeing nothing loaded yet, must not both call load_model()
+    concurrently - that's what let two simultaneous ~5GB CUDA
+    allocations fail with 'out of memory' in practice even though a
+    single load had plenty of free VRAM. Simulates the race with a
+    barrier so both threads are genuinely inside ensure_mode at once,
+    and a slow fake load so a real race would be caught if the lock
+    weren't there.
+    """
+    import threading
+    import time
+
+    call_count = 0
+    call_count_lock = threading.Lock()
+    start_barrier = threading.Barrier(2)
+
+    def fake_load(*, model_path=None, n_gpu_layers=-1, n_ctx=None, mode="general"):
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        time.sleep(0.05)  # gives a real (unlocked) race a window to double-enter
+        fake = FakeLlama()
+        model_runtime._model = fake
+        model_runtime._current_mode = mode
+        return fake
+
+    monkeypatch.setattr(model_runtime, "load_model", fake_load)
+
+    results = []
+
+    def worker():
+        start_barrier.wait()
+        results.append(model_runtime.ensure_mode("general"))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert call_count == 1, "load_model() ran more than once for a concurrent request pair"
+    assert results[0] is results[1]

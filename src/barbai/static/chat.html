@@ -38,14 +38,33 @@
   select { background: #222; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 0.15rem 0.3rem; }
 </style>
 </head>
+
 <body>
 <h1>BarbAI — temp chat. Talks to /agent/chat; not the real UI (see docs/PACKAGING_ROADMAP.md Phase 4.0).</h1>
+
 <div id="controls">
-  <label>mode <select id="mode"><option value="general">general</option><option value="coding">coding</option></select></label>
-  <label>thinking <select id="thinking"><option value="thinking" selected>thinking</option><option value="fast">fast</option><option value="extended">extended</option></select></label>
+  <label>
+    mode
+    <select id="mode">
+      <option value="general">general</option>
+      <option value="coding">coding</option>
+    </select>
+  </label>
+
+  <label>
+    thinking
+    <select id="thinking">
+      <option value="thinking" selected>thinking</option>
+      <option value="fast">fast</option>
+      <option value="extended">extended</option>
+    </select>
+  </label>
+
   <span id="sessionLabel"></span>
 </div>
+
 <div id="log"></div>
+
 <div id="inputRow">
   <textarea id="input" placeholder="Message BarbAI... (Enter to send, Shift+Enter for newline)"></textarea>
   <button id="send">Send</button>
@@ -57,39 +76,84 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const modeSel = document.getElementById('mode');
 const thinkingSel = document.getElementById('thinking');
+
 const sessionId = 'temp-ui-' + Math.random().toString(36).slice(2, 10);
-document.getElementById('sessionLabel').textContent = 'session: ' + sessionId + ' (this tab only)';
+
+document.getElementById('sessionLabel').textContent =
+  'session: ' + sessionId + ' (this tab only)';
+
 
 function addMsg(role, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   div.textContent = text;
   log.appendChild(div);
-  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+  div.scrollIntoView({ behavior: 'smooth', block: 'end' });
   return div;
 }
+
 
 function addSystemNote(text) {
   const div = document.createElement('div');
   div.className = 'msg system-note';
   div.textContent = text;
   log.appendChild(div);
-  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+  div.scrollIntoView({ behavior: 'smooth', block: 'end' });
 }
 
+
+/*
+ * Send a request to BarbAI.
+ *
+ * IMPORTANT:
+ * The response body is read exactly ONCE with resp.text().
+ * We then parse that stored text ourselves.
+ *
+ * This prevents:
+ *
+ *     Response.text: Body has already been consumed
+ *
+ * because resp.json() and resp.text() cannot both consume
+ * the same Response body.
+ */
 async function callAgent(body) {
   const resp = await fetch('/agent/chat', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
   });
+
+  // Consume the response body exactly once.
+  const rawText = await resp.text();
+
   if (!resp.ok) {
     let detail = '';
-    try { detail = (await resp.json()).detail || ''; } catch (e) { detail = await resp.text(); }
-    throw new Error(`HTTP ${resp.status}${detail ? ': ' + detail : ''}`);
+
+    try {
+      const data = JSON.parse(rawText);
+      detail = data.detail || '';
+    } catch {
+      // The response wasn't JSON, so use the raw response body.
+      detail = rawText;
+    }
+
+    throw new Error(
+      `HTTP ${resp.status}${detail ? ': ' + detail : ''}`
+    );
   }
-  return resp.json();
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    throw new Error(
+      'Server returned invalid JSON' +
+      (rawText ? ': ' + rawText : '')
+    );
+  }
 }
+
 
 function renderApproval(result) {
   const div = document.createElement('div');
@@ -97,20 +161,30 @@ function renderApproval(result) {
 
   const title = document.createElement('div');
   title.className = 'title';
-  title.textContent = 'BarbAI wants to run this - review before it does:';
+  title.textContent =
+    'BarbAI wants to run this - review before it does:';
+
   div.appendChild(title);
 
   result.pending.forEach(call => {
     const pre = document.createElement('pre');
-    pre.textContent = call.name + '(' + JSON.stringify(call.arguments, null, 2) + ')';
+
+    pre.textContent =
+      call.name +
+      '(' +
+      JSON.stringify(call.arguments, null, 2) +
+      ')';
+
     div.appendChild(pre);
   });
 
   const buttons = document.createElement('div');
   buttons.className = 'buttons';
+
   const approveBtn = document.createElement('button');
   approveBtn.textContent = 'Approve';
   approveBtn.className = 'approve';
+
   const denyBtn = document.createElement('button');
   denyBtn.textContent = 'Deny';
   denyBtn.className = 'deny';
@@ -118,11 +192,21 @@ function renderApproval(result) {
   const resolve = async (value) => {
     approveBtn.disabled = true;
     denyBtn.disabled = true;
+
     try {
       const approvals = {};
-      result.pending.forEach(call => { approvals[call.id] = value; });
-      const next = await callAgent({conversation: result.conversation, approvals});
+
+      result.pending.forEach(call => {
+        approvals[call.id] = value;
+      });
+
+      const next = await callAgent({
+        conversation: result.conversation,
+        approvals
+      });
+
       await handleAgentResponse(next);
+
     } catch (err) {
       addSystemNote('Error resuming: ' + err.message);
     }
@@ -130,65 +214,104 @@ function renderApproval(result) {
 
   approveBtn.onclick = () => resolve(true);
   denyBtn.onclick = () => resolve(false);
+
   buttons.appendChild(approveBtn);
   buttons.appendChild(denyBtn);
   div.appendChild(buttons);
 
   log.appendChild(div);
-  div.scrollIntoView({behavior: 'smooth', block: 'end'});
+  div.scrollIntoView({ behavior: 'smooth', block: 'end' });
 }
+
 
 async function handleAgentResponse(result) {
   if (result.status === 'pending_approval') {
+
     renderApproval(result);
+
   } else if (result.status === 'final') {
+
     addMsg('assistant', result.reply || '(empty reply)');
+
   } else if (result.status === 'stuck') {
+
     addMsg('assistant', result.reply || '(stuck)');
-    addSystemNote('BarbAI stopped itself - repeated the same action with the same result twice in a row.');
+
+    addSystemNote(
+      'BarbAI stopped itself - repeated the same action with the same result twice in a row.'
+    );
+
   } else {
-    addSystemNote('Unexpected response: ' + JSON.stringify(result));
+
+    addSystemNote(
+      'Unexpected response: ' + JSON.stringify(result)
+    );
   }
 }
 
+
 async function send() {
   const text = input.value.trim();
+
   if (!text) return;
+
   input.value = '';
   input.style.height = 'auto';
   sendBtn.disabled = true;
+
   addMsg('user', text);
 
   try {
     const result = await callAgent({
-      messages: [{role: 'user', content: text}],
+      messages: [
+        {
+          role: 'user',
+          content: text
+        }
+      ],
       session_id: sessionId,
       mode: modeSel.value,
-      thinking: thinkingSel.value,
+      thinking: thinkingSel.value
     });
+
     await handleAgentResponse(result);
+
   } catch (err) {
+
     addSystemNote('Error: ' + err.message);
+
   } finally {
+
     sendBtn.disabled = false;
     input.focus();
   }
 }
 
+
 sendBtn.onclick = send;
+
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     send();
   }
 });
+
+
 input.addEventListener('input', () => {
   input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 128) + 'px';
+  input.style.height =
+    Math.min(input.scrollHeight, 128) + 'px';
 });
 
-addSystemNote('Ready. Gated actions (write_file, patch_file, run_command, remember) will show an approve/deny card before running.');
+
+addSystemNote(
+  'Ready. Gated actions (write_file, patch_file, run_command, remember) will show an approve/deny card before running.'
+);
+
 input.focus();
 </script>
+
 </body>
 </html>
