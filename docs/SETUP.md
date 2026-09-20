@@ -117,18 +117,56 @@ prompt plus its full built-in tool-definition set is large enough that
 it's very likely already past BarbAI's default 4096-token context window
 before any actual conversation happens. Raise it with `BARBAI_N_CTX`
 (e.g. `export BARBAI_N_CTX=32768`, within what Qwen3.5's own native
-context supports) — but a larger context means a larger KV cache, which
-needs more VRAM on top of the model weights, and it adds up fast:
-measured live on this project's own 4070 (8GB), Qwen3.5-9B at the
-default 4096 leaves comfortable headroom, but `BARBAI_N_CTX=16384` alone
-drops free VRAM from ~7780MiB to **~1408MiB** — right at
-`core/hardware.py`'s `RESERVED_FLOOR_MB` safety floor. There's no
-automatic check that a given value still fits your card; watch
-`nvidia-smi` or `/health` after raising it, and expect to need a smaller
-model (the `fast`-tier picks, Qwen3.5-4B/2B - see
-`docs/BARBAI_ROADMAP.md` Phase 2.1) if you want real headroom at a large
-context on an 8GB-class card. Beyond context size, Qwen3.5-9B/4B's
+context supports) — see section 5 below for what that actually costs in
+VRAM before picking a number. Beyond context size, Qwen3.5-9B/4B's
 tool-calling reliability has only been verified against BarbAI's own
 small native tool set (Phase 2.2/3.1's testing) — not against the CLI's
 larger, more complex built-in tools, which is genuinely untested
 territory.
+
+## 5. Choosing `BARBAI_N_CTX`
+
+Not just a Claude Code CLI concern — since Phase 2.3's context-overflow
+fix (`core/model_runtime.py`'s `fit_to_context()`, see
+`docs/BARBAI_ROADMAP.md`), a conversation that outgrows `n_ctx` no
+longer crashes, it just starts quietly forgetting its oldest turns. The
+default 4096 makes that kick in fast - real multi-turn conversations hit
+it within a handful of exchanges. Raising it buys more conversation
+before that starts, at a real, measurable VRAM cost.
+
+Measured live on this project's own dev machine (RTX 4070 Laptop, 8GB,
+with a normal desktop session - browser, Discord, etc. - already running
+in the background, since that's the realistic case, not an idle
+benchmark rig) - loading Qwen3.5-9B Q4_K_M at each context size:
+
+| `BARBAI_N_CTX` | Free VRAM after load | Headroom above the 1536MiB safety floor |
+|---|---|---|
+| 4096 (default) | ~1650MiB | comfortable |
+| 8192 | ~1522MiB | thin - right at the floor |
+| 12288 | ~1394MiB | **below the floor** |
+| 32768 | ~122MiB | dangerously tight, don't |
+
+The jump from 4096 to 8192 only costs ~128MiB - Qwen3.5's architecture
+mixes attention layers with SSM (Mamba-style) layers that don't scale
+with context the way a pure-attention KV cache does, which is why this
+is far gentler than a naive per-token estimate would suggest. But it's
+not free, and it's not perfectly linear either - the cost accelerates
+at higher context sizes (12288→32768, a 2.7x jump, cost roughly 10x the
+VRAM that 4096→8192 did).
+
+**Recommendation for an 8GB-class card:** `BARBAI_N_CTX=8192` is a
+reasonable ceiling *if nothing else is contending for VRAM at the
+moment* - it's right at this project's own safety floor with a normal
+background app load, not comfortably above it. Going to 12288 or higher
+means closing other GPU-using apps first, not just setting the variable
+and hoping. Stay at the 4096 default if you want real margin for
+whatever else is running. Either way: this is what *this* machine showed
+with *this* background load - your own headroom depends on what else is
+using your GPU, the same "measure it, don't assume it" lesson
+`core/hardware.py`'s own tiering is built around. Check `nvidia-smi` or
+`/health` after changing it, on your own machine, before trusting a
+number from here.
+
+Setting it: `export BARBAI_N_CTX=8192` before starting the server (`uv
+run barbai`) - it's read once at model-load time, so an already-running
+server needs a restart to pick up a new value.

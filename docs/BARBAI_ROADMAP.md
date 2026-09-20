@@ -372,6 +372,27 @@ vars to hand-configure - is its own phase, broken down separately in
   yet on `/chat` (rejected with a 400) — streaming would need to
   accumulate the full reply before it could be persisted, deferred until
   it's actually needed.
+- **Context-window overflow — real bug, found in practice, fixed —
+  drop-based v1, summarization is the deferred v2.** The rolling window
+  above bounds session history by *message count*, not token count, so a
+  handful of verbose exchanges could still exceed `n_ctx` and crash with
+  a bare `ValueError` surfaced as a raw 500 - hit by an actual user, not
+  a hypothetical. Fixed with `core/model_runtime.py`'s `count_tokens()`/
+  `fit_to_context()`: drops the oldest messages (after any system
+  message, never the newest one) until what's left fits the model's real
+  context window, using the model's own tokenizer rather than trusting
+  the message-count window alone. Wired into both `core/agent.py`'s
+  `run_agent` (every model call) and `api/native.py`'s `/chat`. This is
+  the same explicit-first-summarize-later split already made for global
+  memory above, applied to a different thing: **v1 (done) drops the
+  oldest turns with no trace**; **v2 (deferred, not started) would
+  summarize them before dropping** - the same gap between ChatGPT/Claude
+  auto-extracting facts (v1-shaped, cheap) versus Claude's own
+  conversation-level auto-summarization (v2-shaped, preserves
+  continuity). Revisit only once "conversations quietly losing their
+  early context" is actually felt as a real problem in practice, not
+  preemptively - dropping already stops the crash, which was the
+  actually-reported bug.
 - **Global memory (cross-conversation, not per-session) — done, explicit-only.**
   Session memory above is per-`session_id` and scoped to one conversation;
   this is the separate "BarbAI remembers things about you across every
