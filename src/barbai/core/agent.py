@@ -62,8 +62,7 @@ from __future__ import annotations
 
 import json
 
-from barbai.core import model_runtime
-from barbai.core.tool_calls import UnrecognizedToolCallFormatError, to_openai_message
+from barbai.core.tool_calls import UnrecognizedToolCallFormatError, generate_message
 from barbai.core.tools import GATED_TOOLS, ToolExecutionError, build_tool_defs, execute_tool
 
 MAX_ITERATIONS = 20
@@ -165,19 +164,12 @@ def run_agent(
         # room for a response at all) - same clean-error treatment as an
         # overflow surfacing from the actual model call below.
         try:
-            trimmed_messages = model_runtime.fit_to_context(llm, messages)
-            raw = model_runtime.create_chat_completion(
-                llm, messages=trimmed_messages, tools=tool_defs, thinking_mode=thinking_mode
-            )
+            message, _ = generate_message(llm, messages, thinking_mode=thinking_mode, tools=tool_defs)
         except ValueError as exc:
             raise AgentError(
                 f"conversation is too long for the current context window even after trimming ({exc}) - "
                 "start a new session or raise BARBAI_N_CTX"
             ) from exc
-        try:
-            message = to_openai_message(
-                raw["choices"][0]["message"], finish_reason=raw["choices"][0].get("finish_reason")
-            )
         except UnrecognizedToolCallFormatError as exc:
             raise AgentError(str(exc)) from exc
 

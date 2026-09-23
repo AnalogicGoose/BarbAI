@@ -4,10 +4,30 @@ import pytest
 
 from barbai.core.tool_calls import (
     TagStreamParser,
+    TruncatedToolCallError,
     UnrecognizedToolCallFormatError,
+    generate_message,
     parse_tool_call_tags,
     to_openai_message,
 )
+
+
+class _FakeLlm:
+    """Stands in for llama_cpp.Llama - just enough for
+    model_runtime.fit_to_context() to work against it."""
+
+    def __init__(self, n_ctx: int = 100_000):
+        self._n_ctx = n_ctx
+
+    def n_ctx(self) -> int:
+        return self._n_ctx
+
+    def tokenize(self, data: bytes, add_bos: bool = False, special: bool = False) -> list[int]:
+        return list(range(len(data.split()) or 1))
+
+
+def _raw(content, finish_reason="stop"):
+    return {"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}]}
 
 
 def test_parse_tool_call_tags_basic():
@@ -57,6 +77,29 @@ def test_to_openai_message_plain_reply():
     result = to_openai_message(raw)
     assert result["content"] == "Hello there"
     assert result["reasoning_content"] == "reasoning"
+
+
+def test_to_openai_message_truncated_tool_call_raises():
+    raw = {
+        "role": "assistant",
+        "content": "</think>\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf a doc",
+    }
+    with pytest.raises(TruncatedToolCallError):
+        to_openai_message(raw, finish_reason="length")
+
+
+def test_to_openai_message_unclosed_tool_call_without_length_finish_reason_falls_through():
+    """Only finish_reason == "length" is strong enough evidence of a
+    truncated generation to raise on - an unclosed tag with no
+    finish_reason info (or a non-length one) falls back to the old
+    behavior (still not great, but not confidently "truncated" either)."""
+    raw = {
+        "role": "assistant",
+        "content": "</think>\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf a doc",
+    }
+    result = to_openai_message(raw)
+    assert "tool_calls" not in result
+    assert "<tool_call>" in result["content"]
 
 
 def _merge(events):
@@ -141,3 +184,69 @@ def test_stream_close_tag_split_across_feed_boundary():
     assert len(tool_calls) == 1
     assert tool_calls[0]["name"] == "get_weather"
     assert tool_calls[0]["arguments"] == {"location": "Tokyo"}
+
+
+def test_stream_truncated_mid_tool_call_flushes_instead_of_dropping():
+    """Regression test: a stream that ends mid <tool_call> (closing tags
+    never arrived) used to vanish with no event at all - finish() only
+    handled the reasoning/content states. Now the partial tag text is
+    surfaced as content instead of silently discarded."""
+    chunks = ["deciding", "</think>", "\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf a doc"]
+    result = _run(chunks)
+    assert result == [
+        {"type": "reasoning", "text": "deciding"},
+        {"type": "content", "text": "\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf a doc"},
+    ]
+
+
+def test_generate_message_returns_message_and_trimmed_messages(monkeypatch):
+    monkeypatch.setattr(
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
+        lambda llm, messages, **kwargs: _raw("Hello there"),
+    )
+    message, trimmed = generate_message(_FakeLlm(), [{"role": "user", "content": "hi"}])
+    assert message["content"] == "Hello there"
+    assert trimmed == [{"role": "user", "content": "hi"}]
+
+
+def test_generate_message_retries_once_with_a_larger_reserve_on_truncation(monkeypatch):
+    fit_calls = []
+
+    def fake_fit(llm, messages, reserved_for_response=None):
+        fit_calls.append(reserved_for_response)
+        return messages
+
+    completions = iter(
+        [
+            _raw("</think>\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf", finish_reason="length"),
+            _raw("all good now"),
+        ]
+    )
+
+    monkeypatch.setattr("barbai.core.tool_calls.model_runtime.fit_to_context", fake_fit)
+    monkeypatch.setattr(
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
+        lambda llm, messages, **kwargs: next(completions),
+    )
+
+    message, _ = generate_message(_FakeLlm(n_ctx=8192), [{"role": "user", "content": "hi"}])
+
+    assert message["content"] == "all good now"
+    assert len(fit_calls) == 2
+    assert fit_calls[1] == fit_calls[0] * 2
+
+
+def test_generate_message_gives_up_after_one_retry(monkeypatch):
+    monkeypatch.setattr(
+        "barbai.core.tool_calls.model_runtime.fit_to_context",
+        lambda llm, messages, reserved_for_response=None: messages,
+    )
+    monkeypatch.setattr(
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
+        lambda llm, messages, **kwargs: _raw(
+            "</think>\n\n<tool_call>\n<function=write_file>\n<parameter=content>\nhalf", finish_reason="length"
+        ),
+    )
+
+    with pytest.raises(TruncatedToolCallError):
+        generate_message(_FakeLlm(n_ctx=8192), [{"role": "user", "content": "hi"}])

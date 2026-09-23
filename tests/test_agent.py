@@ -39,7 +39,7 @@ def _tool_call(call_id, name, arguments):
 
 def test_no_tool_call_returns_immediately(monkeypatch):
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: _raw("Hello there"),
     )
     result = run_agent(llm=_FakeLlm(), messages=[{"role": "user", "content": "hi"}])
@@ -61,7 +61,7 @@ def test_multi_round_tool_calls_regression(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "some tool result")
@@ -73,7 +73,7 @@ def test_multi_round_tool_calls_regression(monkeypatch):
 
 def test_exceeds_max_iterations_raises(monkeypatch):
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: _raw(
             None, tool_calls=[_tool_call("call_x", "read_file", {"path": "x.txt"})], finish_reason="tool_calls"
         ),
@@ -91,7 +91,7 @@ def test_tool_execution_error_fed_back_not_raised(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
 
@@ -109,9 +109,9 @@ def test_unrecognized_tool_format_raises_agent_error(monkeypatch):
     def raise_unrecognized(*args, **kwargs):
         raise UnrecognizedToolCallFormatError("bad format")
 
-    monkeypatch.setattr("barbai.core.agent.to_openai_message", raise_unrecognized)
+    monkeypatch.setattr("barbai.core.tool_calls.to_openai_message", raise_unrecognized)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: _raw("whatever"),
     )
     with pytest.raises(AgentError):
@@ -120,7 +120,7 @@ def test_unrecognized_tool_format_raises_agent_error(monkeypatch):
 
 def test_gated_tool_call_pauses_for_approval(monkeypatch):
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: _raw(
             None,
             tool_calls=[_tool_call("call_w1", "write_file", {"path": "out.txt", "content": "hi"})],
@@ -151,7 +151,7 @@ def test_resuming_with_approval_executes_the_tool(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "wrote 2 characters")
@@ -180,7 +180,7 @@ def test_resuming_with_denial_skips_execution(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
 
@@ -208,7 +208,7 @@ def test_read_file_not_gated_runs_without_approval(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "file contents")
@@ -226,7 +226,7 @@ def test_stuck_detection_stops_on_repeated_identical_round(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "same result every time")
@@ -244,7 +244,7 @@ def test_stuck_detection_ignores_different_arguments(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     monkeypatch.setattr("barbai.core.agent.execute_tool", lambda name, arguments: "same content")
@@ -262,7 +262,7 @@ def test_stuck_detection_ignores_different_results(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
     results = iter(["first result", "second result"])
@@ -288,7 +288,7 @@ def test_stuck_detection_across_resume_with_repeated_denial(monkeypatch):
     ]
     call_iter = iter(calls)
     monkeypatch.setattr(
-        "barbai.core.agent.model_runtime.create_chat_completion",
+        "barbai.core.tool_calls.model_runtime.create_chat_completion",
         lambda llm, **kwargs: next(call_iter),
     )
 
@@ -312,10 +312,11 @@ def test_stuck_detection_across_resume_with_repeated_denial(monkeypatch):
 
 
 def test_run_agent_trims_only_the_view_sent_to_the_model(monkeypatch):
-    # run_agent uses fit_to_context's default 512-token reserve, so n_ctx
-    # has to clear that plus enough room for system+newest (~20 tokens)
-    # to avoid raising outright, while still being tight enough that the
-    # 4 verbose "old" messages below don't all fit.
+    # run_agent's reserved_for_response floors at 512 tokens (25% of this
+    # small an n_ctx would resolve lower, so the floor is what applies),
+    # so n_ctx has to clear that plus enough room for system+newest (~20
+    # tokens) to avoid raising outright, while still being tight enough
+    # that the 4 verbose "old" messages below don't all fit.
     llm = _FakeLlm(n_ctx=560)
     seen_messages = []
 
@@ -323,7 +324,7 @@ def test_run_agent_trims_only_the_view_sent_to_the_model(monkeypatch):
         seen_messages.append(list(messages))
         return _raw("done")
 
-    monkeypatch.setattr("barbai.core.agent.model_runtime.create_chat_completion", fake_create)
+    monkeypatch.setattr("barbai.core.tool_calls.model_runtime.create_chat_completion", fake_create)
 
     full_history = [
         {"role": "system", "content": "sys"},
@@ -348,7 +349,7 @@ def test_run_agent_converts_residual_context_overflow_to_agent_error(monkeypatch
     def fake_create(llm, messages, **kwargs):
         raise ValueError("Requested tokens (9999) exceed context window of 4096")
 
-    monkeypatch.setattr("barbai.core.agent.model_runtime.create_chat_completion", fake_create)
+    monkeypatch.setattr("barbai.core.tool_calls.model_runtime.create_chat_completion", fake_create)
 
     with pytest.raises(AgentError, match="too long"):
         run_agent(llm=_FakeLlm(), messages=[{"role": "user", "content": "hi"}])

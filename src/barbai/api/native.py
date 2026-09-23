@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from barbai.core import memory, model_runtime
 from barbai.core.persona import build_system_prompt
-from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, to_openai_message
+from barbai.core.tool_calls import TagStreamParser, UnrecognizedToolCallFormatError, generate_message
 
 router = APIRouter()
 
@@ -135,19 +135,20 @@ def chat(request: NativeChatRequest):
     messages = [
         {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
     ] + history + new_messages
-    # A long session_id conversation can grow past the context window on
-    # its own (see core.model_runtime.fit_to_context's docstring for why
-    # this matters - a real crash, not a hypothetical). The streaming
-    # path can still fail mid-stream if this estimate runs short, since
-    # headers are already sent by the time llama.cpp would raise - a much
-    # rarer residual case now than an unguarded call, not eliminated.
-    messages = model_runtime.fit_to_context(llm, messages)
 
     if request.stream:
-        return StreamingResponse(_stream_chat(llm, messages, **kwargs), media_type="text/event-stream")
+        # A long session_id conversation can grow past the context window
+        # on its own (see core.model_runtime.fit_to_context's docstring
+        # for why this matters - a real crash, not a hypothetical).
+        # Streaming can't retry a truncated tool call after tokens are
+        # already sent to the client (see generate_message's docstring
+        # for why the non-streaming path below gets a retry and this one
+        # doesn't) - trim once up front and accept whatever comes back.
+        trimmed = model_runtime.fit_to_context(llm, messages)
+        return StreamingResponse(_stream_chat(llm, trimmed, **kwargs), media_type="text/event-stream")
 
     try:
-        raw = model_runtime.create_chat_completion(llm, messages=cast(Any, messages), **kwargs)
+        message, _ = generate_message(llm, messages, **kwargs)
     except ValueError as exc:
         raise HTTPException(
             status_code=413,
@@ -156,11 +157,6 @@ def chat(request: NativeChatRequest):
                 "start a new session or raise BARBAI_N_CTX"
             ),
         ) from exc
-
-    try:
-        message = to_openai_message(
-            raw["choices"][0]["message"], finish_reason=raw["choices"][0].get("finish_reason")
-        )
     except UnrecognizedToolCallFormatError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

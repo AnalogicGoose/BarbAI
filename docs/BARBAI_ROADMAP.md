@@ -394,7 +394,7 @@ vars to hand-configure - is its own phase, broken down separately in
   preemptively - dropping already stops the crash, which was the
   actually-reported bug.
 - **Second, distinct context bug found (2026-09-23, session
-  `temp-ui-juta1nre`) - not yet fixed.** The fix above covers *input*
+  `temp-ui-juta1nre`) - fixed, both pieces.** The fix above covers *input*
   overflow (too much history to send). This one is *output* overflow:
   `fit_to_context`'s `reserved_for_response` (`DEFAULT_RESERVED_FOR_RESPONSE
   = 512` tokens, `core/model_runtime.py`) is a fixed budget the model has
@@ -419,7 +419,25 @@ vars to hand-configure - is its own phase, broken down separately in
   - possibly tool-aware rather than one flat constant; (2) the parser/
   agent loop needs to detect a truncated `<tool_call>` (unclosed tag plus
   `finish_reason == "length"`) and fail loudly/retry instead of emitting
-  it as content.
+  it as content. **Both built** (commits `65d1d46`, and the retry piece
+  right after): (1) `reserved_for_response` now scales with `n_ctx`
+  (`_RESERVED_FOR_RESPONSE_RATIO = 0.25`, clamped
+  512-4096, `BARBAI_RESERVED_FOR_RESPONSE` override) instead of a flat
+  512; (2) `to_openai_message`/`TagStreamParser` detect a truncated
+  `<tool_call>` via `finish_reason == "length"` and raise
+  `TruncatedToolCallError` instead of emitting it as content -
+  `core/tool_calls.py::generate_message()` (the shared
+  `fit_to_context` → `create_chat_completion` → `to_openai_message`
+  sequence every non-streaming endpoint now goes through) catches that
+  specifically and **retries once with the reserve doubled**, on the
+  reasoning that just re-issuing the same call would truncate at the
+  same place again - only a genuinely bigger response budget has a
+  chance of finishing it. Gives up and raises after one retry (an
+  absorb-the-occasional-case decision, not a systematic-undersizing
+  fix). Streaming can't retry after tokens are already sent to the
+  client, so it keeps the older, non-raising behavior (flush the
+  partial tag text as content, `TagStreamParser.finish()`) rather than
+  failing mid-stream.
 - **Global memory (cross-conversation, not per-session) — done, explicit-only.**
   Session memory above is per-`session_id` and scoped to one conversation;
   this is the separate "BarbAI remembers things about you across every

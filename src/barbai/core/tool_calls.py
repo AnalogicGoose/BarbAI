@@ -19,6 +19,13 @@ fed raw text deltas as they arrive (which can split a tag like </tool_call>
 across arbitrary chunk boundaries - llama-cpp-python streams word/sub-word
 fragments, not whole tags), it yields reasoning/content/tool_call events
 without waiting for the full response.
+
+`generate_message` (bottom of this file) is the non-streaming
+fit_to_context -> create_chat_completion -> to_openai_message sequence
+every non-streaming endpoint needs, with one automatic retry at a larger
+response reserve if the first attempt truncated mid tool-call
+(TruncatedToolCallError) - see its own docstring for why a bigger reserve,
+not just "try again," is the right retry.
 """
 
 from __future__ import annotations
@@ -26,6 +33,8 @@ from __future__ import annotations
 import json
 import re
 import uuid
+
+from barbai.core import model_runtime
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNCTION_RE = re.compile(r"<function=(?P<name>[^>]+)>\s*(?P<body>.*?)\s*</function>", re.DOTALL)
@@ -235,3 +244,45 @@ class TagStreamParser:
             events.append({"type": "content", "text": _TOOL_CALL_OPEN + self._buf})
         self._buf = ""
         return events
+
+
+_MAX_TRUNCATION_RETRIES = 1
+_RETRY_RESERVE_MULTIPLIER = 2
+
+
+def generate_message(
+    llm, messages: list[dict], *, thinking_mode: str = "thinking", reserved_for_response: int | None = None, **kwargs
+) -> tuple[dict, list[dict]]:
+    """fit_to_context() + create_chat_completion() + to_openai_message(),
+    the sequence every non-streaming endpoint needs - with one automatic
+    retry if the first attempt truncated mid tool-call
+    (TruncatedToolCallError).
+
+    Just re-issuing the same call would truncate at the same place again
+    - the model ran out of *room*, not luck. The retry instead doubles
+    reserved_for_response, which makes fit_to_context() trim more input
+    to free real room for the response, then tries once more. Gives up
+    and re-raises after one retry (surfacing as the same
+    UnrecognizedToolCallFormatError-family error every caller already
+    handles) - this is meant to absorb an occasional undersized budget,
+    not paper over a systematically too-small one.
+
+    Returns (message, trimmed_messages) - callers that need the exact
+    messages actually sent (e.g. to persist alongside the reply) get them
+    back instead of recomputing fit_to_context themselves.
+    """
+    reserved = model_runtime.resolve_reserved_for_response(llm.n_ctx(), reserved_for_response)
+    for attempt in range(_MAX_TRUNCATION_RETRIES + 1):
+        trimmed = model_runtime.fit_to_context(llm, messages, reserved_for_response=reserved)
+        raw = model_runtime.create_chat_completion(llm, messages=trimmed, thinking_mode=thinking_mode, **kwargs)
+        try:
+            message = to_openai_message(
+                raw["choices"][0]["message"], finish_reason=raw["choices"][0].get("finish_reason")
+            )
+        except TruncatedToolCallError:
+            if attempt >= _MAX_TRUNCATION_RETRIES:
+                raise
+            reserved *= _RETRY_RESERVE_MULTIPLIER
+            continue
+        return message, trimmed
+    raise AssertionError("unreachable - loop above always returns or raises")

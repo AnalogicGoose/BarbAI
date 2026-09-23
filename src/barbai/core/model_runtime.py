@@ -149,7 +149,7 @@ _RESERVED_FOR_RESPONSE_FLOOR = 512
 _RESERVED_FOR_RESPONSE_CEILING = 4096
 _TOKENS_PER_MESSAGE_OVERHEAD = 16  # includes role token + separator overhead (system/user/assistant ~1 each, plus template separators)
 
-def _resolve_reserved_for_response(n_ctx: int, reserved_for_response: int | None) -> int:
+def resolve_reserved_for_response(n_ctx: int, reserved_for_response: int | None) -> int:
     if reserved_for_response is not None:
         return reserved_for_response
     raw = os.environ.get("BARBAI_RESERVED_FOR_RESPONSE")
@@ -193,7 +193,7 @@ def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int 
     if not messages:
         return messages
 
-    reserved_for_response = _resolve_reserved_for_response(llm.n_ctx(), reserved_for_response)
+    reserved_for_response = resolve_reserved_for_response(llm.n_ctx(), reserved_for_response)
     budget = llm.n_ctx() - reserved_for_response
     if budget <= 0:
         raise ValueError(
