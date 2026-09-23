@@ -175,7 +175,9 @@ def run_agent(
                 "start a new session or raise BARBAI_N_CTX"
             ) from exc
         try:
-            message = to_openai_message(raw["choices"][0]["message"])
+            message = to_openai_message(
+                raw["choices"][0]["message"], finish_reason=raw["choices"][0].get("finish_reason")
+            )
         except UnrecognizedToolCallFormatError as exc:
             raise AgentError(str(exc)) from exc
 

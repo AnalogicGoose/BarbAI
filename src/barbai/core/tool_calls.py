@@ -40,6 +40,15 @@ class UnrecognizedToolCallFormatError(RuntimeError):
     """Content looks like a tool call but matches no known format."""
 
 
+class TruncatedToolCallError(UnrecognizedToolCallFormatError):
+    """Generation hit the token/context limit before the tool call's
+    closing tags arrived - this isn't a real, executable tool call, and
+    must never be silently treated as one or shown to the user as if it
+    were a normal reply. Subclasses UnrecognizedToolCallFormatError so
+    every existing call site that already catches that error handles this
+    the same way with no extra except clause needed."""
+
+
 def _split_reasoning(content: str) -> tuple[str, str | None]:
     if "</think>" not in content:
         return content, None
@@ -96,13 +105,23 @@ def parse_tool_call_tags(content: str) -> dict:
     }
 
 
-def to_openai_message(raw_message: dict) -> dict:
-    """Normalize a llama-cpp-python chat completion message to OpenAI shape."""
+def to_openai_message(raw_message: dict, finish_reason: str | None = None) -> dict:
+    """Normalize a llama-cpp-python chat completion message to OpenAI shape.
+
+    finish_reason, when passed, lets this tell a genuinely truncated tool
+    call ("length" - the model ran out of room, closing tags never came)
+    apart from one whose format is simply unrecognized."""
     content = raw_message.get("content") or ""
 
     if raw_message.get("tool_calls"):
         content, reasoning_content = _split_reasoning(content)
         return {**raw_message, "content": content.strip() or None, "reasoning_content": reasoning_content}
+
+    if _TOOL_CALL_OPEN in content and _TOOL_CALL_CLOSE not in content and finish_reason == "length":
+        raise TruncatedToolCallError(
+            "generation hit the token/context limit before the tool call finished - "
+            f"reserved_for_response was too small for this response: {content[:200]!r}"
+        )
 
     if "<tool_call>" in content and "<function=" in content:
         return parse_tool_call_tags(content)
@@ -209,5 +228,10 @@ class TagStreamParser:
             events.append({"type": "reasoning", "text": self._buf.replace("<think>", "")})
         elif self._state == "content" and self._buf:
             events.append({"type": "content", "text": self._buf})
+        elif self._state == "tool_call" and self._buf:
+            # Stream ended mid tool-call - closing tags never arrived.
+            # Surface the raw partial text instead of silently dropping
+            # it, so at least the caller sees something happened.
+            events.append({"type": "content", "text": _TOOL_CALL_OPEN + self._buf})
         self._buf = ""
         return events

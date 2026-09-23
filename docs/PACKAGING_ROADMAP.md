@@ -30,6 +30,26 @@ Nothing here changes what Phase 2/3 build - this is entirely about
 *how a non-technical person ends up with a working install*, layered on
 top of the API that already exists.
 
+**Repo structure — decided 2026-09-23: separate git repos, not
+subdirectories of this one.** Discussed at length (see session
+`temp-ui-juta1nre`): `barbai-cli` and a future `barbai-desktop` are
+their own repos (`barbai-cli`, `barbai-desktop`), cloned/installed
+independently of this one, not folders inside `BarbAI/` in a
+monorepo-with-packages layout. Reasoning: the three install units above
+share nothing but an HTTP contract against the already-versioned API
+(`/v1/...`, `/chat`, `/agent/chat`) - no code, no types, no build
+tooling - so there's no monorepo benefit (shared code, atomic commits
+across packages) to weigh against the real cost of mixing Python/uv,
+Rust/Cargo, and eventually a Tauri/Electron toolchain in one repo. This
+also directly matches the shape already described above ("optional,
+install separately, not bundled with Core") better than a monorepo
+would. Corollary: the `scripts/start-all.sh` / `Makefile` /
+`docker-compose.yml` orchestration pattern some early brainstorming
+considered is **not needed and not planned** - it only earns its keep
+once there are multiple long-running services in *this* repo that need
+to come up together for local dev, and today there's just the one
+FastAPI process. Revisit only if that stops being true.
+
 ## Current state, honestly
 
 What's true today, so nothing below is solved twice or assumed already
@@ -227,5 +247,5 @@ decided by default while implementing:
 2. CPU-first-by-default vs. install-time GPU detection - Phase 4.2.
 3. Desktop app framework (Tauri vs. Electron vs. something else) - Phase 4.4.
 4. Where the tray icon/autostart mechanism actually lives (core background process vs. desktop app only) - Phase 4.3/4.4.
-5. CLI package/command naming, given it must install independently of the core - Phase 4.5.
+5. CLI package/command naming, given it must install independently of the core - Phase 4.5. (Repo-level structure is resolved - see "Repo structure" note near the top of this doc - but the actual command/package *name* itself is still open.)
 6. Code-signing budget and timeline - Phase 4.6.

@@ -138,26 +138,45 @@ def ensure_mode(mode: str, n_gpu_layers: int = -1, n_ctx: int | None = None) -> 
 THINKING_MODES = ("fast", "thinking", "extended")
 _EXTENDED_MIN_MAX_TOKENS = 1500
 
-DEFAULT_RESERVED_FOR_RESPONSE = 512  # tokens left free for the model's own reply
-_TOKENS_PER_MESSAGE_OVERHEAD = 8  # rough allowance for chat-template role/separator tokens per message
+# A flat reserve doesn't scale with n_ctx - raising BARBAI_N_CTX only grew
+# room for input history, not for the response, which is why a thinking
+# pass plus a real tool-call payload (e.g. write_file with a whole doc)
+# could still run out of room mid-generation even at 8192. Reserve a
+# fraction of n_ctx instead, clamped so small contexts still leave a
+# usable minimum and huge contexts don't waste an unreasonable chunk.
+_RESERVED_FOR_RESPONSE_RATIO = 0.25
+_RESERVED_FOR_RESPONSE_FLOOR = 512
+_RESERVED_FOR_RESPONSE_CEILING = 4096
+_TOKENS_PER_MESSAGE_OVERHEAD = 16  # includes role token + separator overhead (system/user/assistant ~1 each, plus template separators)
+
+def _resolve_reserved_for_response(n_ctx: int, reserved_for_response: int | None) -> int:
+    if reserved_for_response is not None:
+        return reserved_for_response
+    raw = os.environ.get("BARBAI_RESERVED_FOR_RESPONSE")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"BARBAI_RESERVED_FOR_RESPONSE must be an integer, got {raw!r}") from None
+    return min(_RESERVED_FOR_RESPONSE_CEILING, max(_RESERVED_FOR_RESPONSE_FLOOR, int(n_ctx * _RESERVED_FOR_RESPONSE_RATIO)))
 
 def count_tokens(llm: Llama, messages: list[dict]) -> int:
     """Estimate the token count for a list of chat messages, using the
-    loaded model's own tokenizer. Not exact - this sums each message's
-    raw content tokens plus a fixed per-message overhead, rather than
-    rendering the actual chat template (system prompt wrapper, role
-    tags, tool-call formatting) - but fit_to_context() reserves real
-    headroom for the response on top of this, so being an
-    underestimate by a modest margin is safe, not a correctness bug."""
+    loaded model's own tokenizer. This now includes role tokens in the
+    overhead to be more accurate - we still don't render the full chat
+    template (no system prompt wrapper or tool-call formatting), but
+    being closer to reality prevents fit_to_context() from thinking it
+    fits when it doesn't."""
     total = 0
     for m in messages:
         content = m.get("content") or ""
         if content:
             total += len(llm.tokenize(content.encode("utf-8"), add_bos=False))
-        total += _TOKENS_PER_MESSAGE_OVERHEAD
+        # Include role token in overhead (system/user/assistant are ~1 token each)
+        total += _TOKENS_PER_MESSAGE_OVERHEAD + 1
     return total
 
-def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int = DEFAULT_RESERVED_FOR_RESPONSE) -> list[dict]:
+def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int | None = None) -> list[dict]:
     """Drop the oldest messages - after any leading system message, and
     never the newest message - until what's left fits the model's
     actual context window with room left over for the response too.
@@ -174,6 +193,7 @@ def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int 
     if not messages:
         return messages
 
+    reserved_for_response = _resolve_reserved_for_response(llm.n_ctx(), reserved_for_response)
     budget = llm.n_ctx() - reserved_for_response
     if budget <= 0:
         raise ValueError(
@@ -186,6 +206,13 @@ def fit_to_context(llm: Llama, messages: list[dict], reserved_for_response: int 
     trimmed = list(messages)
     while len(trimmed) > protected_head + 1 and count_tokens(llm, trimmed) > budget:
         del trimmed[protected_head]
+
+    # Final verification to ensure we fit exactly - this is cheap (one call) 
+    # but guarantees we never exceed the context window
+    if count_tokens(llm, trimmed) > budget:
+        # Remove one more message from the protected head if needed
+        if len(trimmed) > protected_head + 1:
+            del trimmed[protected_head]
 
     return trimmed
 

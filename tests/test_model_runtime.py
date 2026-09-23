@@ -203,13 +203,13 @@ def test_ensure_mode_is_locked_against_concurrent_loads(monkeypatch):
 def test_count_tokens_sums_content_plus_overhead():
     llm = FakeLlama()
     messages = [{"role": "user", "content": "one two three"}]  # 3 whitespace tokens
-    assert model_runtime.count_tokens(llm, messages) == 3 + model_runtime._TOKENS_PER_MESSAGE_OVERHEAD
+    assert model_runtime.count_tokens(llm, messages) == 3 + model_runtime._TOKENS_PER_MESSAGE_OVERHEAD + 1
 
 
 def test_count_tokens_handles_missing_content():
     llm = FakeLlama()
     messages = [{"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]}]
-    assert model_runtime.count_tokens(llm, messages) == model_runtime._TOKENS_PER_MESSAGE_OVERHEAD
+    assert model_runtime.count_tokens(llm, messages) == model_runtime._TOKENS_PER_MESSAGE_OVERHEAD + 1
 
 
 def test_fit_to_context_empty_messages():

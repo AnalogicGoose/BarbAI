@@ -393,6 +393,33 @@ vars to hand-configure - is its own phase, broken down separately in
   early context" is actually felt as a real problem in practice, not
   preemptively - dropping already stops the crash, which was the
   actually-reported bug.
+- **Second, distinct context bug found (2026-09-23, session
+  `temp-ui-juta1nre`) - not yet fixed.** The fix above covers *input*
+  overflow (too much history to send). This one is *output* overflow:
+  `fit_to_context`'s `reserved_for_response` (`DEFAULT_RESERVED_FOR_RESPONSE
+  = 512` tokens, `core/model_runtime.py`) is a fixed budget the model has
+  to fit its `<think>` pass *and* the full tool call (including a large
+  `write_file` argument, e.g. a whole doc) into, regardless of
+  `BARBAI_N_CTX` - raising `BARBAI_N_CTX` only grows room for input
+  history, it does nothing for this budget. Confirmed live: asked Barb (in
+  `thinking` mode) to `write_file` a multi-section markdown doc,
+  generation hit the context limit mid-`<tool_call>` before the closing
+  tags, and `core/tool_calls.py`'s `parse_tool_call_tags` - which requires
+  a matched closing `</tool_call>` - silently fell through to treating the
+  truncated, malformed tag soup as ordinary assistant `content`. Net
+  effect: the tool never ran (nothing was written), the broken tags were
+  shown to the user as if they were a real reply, and - worse - that
+  garbled blob then became part of the persisted conversation history,
+  eating into the budget for the *next* turn too (it happened twice in a
+  row in that session). `core/agent.py`'s loop also never looks at
+  `finish_reason` at all, so a `"length"`-truncated response and a normal
+  `"stop"` response are handled identically. Two independent fixes
+  needed, neither built yet: (1) `reserved_for_response` needs to be
+  large enough for a real tool-call payload, not just a short chat reply
+  - possibly tool-aware rather than one flat constant; (2) the parser/
+  agent loop needs to detect a truncated `<tool_call>` (unclosed tag plus
+  `finish_reason == "length"`) and fail loudly/retry instead of emitting
+  it as content.
 - **Global memory (cross-conversation, not per-session) — done, explicit-only.**
   Session memory above is per-`session_id` and scoped to one conversation;
   this is the separate "BarbAI remembers things about you across every
@@ -435,6 +462,28 @@ vars to hand-configure - is its own phase, broken down separately in
   package yet — not needed until a second contributor actually shows up
   and needs to work on an independent piece without colliding.
 - Not done: no automated tests exist anywhere in the project yet.
+
+### Phase 2.5 — Memory V2 — next up (not started)
+Everything in Phase 2.3 above is v1: a raw JSONL log, a message-count
+rolling window, and explicit-only global facts — "start dumb," on
+purpose. Decided 2026-09-23 to pick this back up as the next real API
+work, rather than moving on to a new feature area. Scope, not yet
+finalized:
+- **Session summarization**, the v2 already flagged as deferred in Phase
+  2.3 above: when `rolling_window`/`fit_to_context` would otherwise drop
+  old turns with no trace, summarize what's being dropped instead of
+  discarding it outright — same "ChatGPT-style cheap extraction vs.
+  Claude-style conversation summarization" distinction called out there.
+  Open question to settle before building: summarize synchronously
+  (inline, when a turn is about to be dropped) or idle-triggered like
+  Mana's approach (section 6 above) — the synchronous version is simpler
+  and has no scheduling to build, the idle version doesn't cost latency
+  on a live request.
+- Whether this shares any machinery with the Phase 2.3 output-truncation
+  bug above — a summarization pass is itself a large generation that
+  needs the same "don't silently truncate" guarantee once that's fixed,
+  so fixing the truncation bug first is worth doing before leaning on
+  summarization for anything load-bearing.
 
 ### Deferred
 Voice (whisper.cpp STT + a TTS provider), avatar, remote messaging

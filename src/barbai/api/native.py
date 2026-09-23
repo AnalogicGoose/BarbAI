@@ -158,7 +158,9 @@ def chat(request: NativeChatRequest):
         ) from exc
 
     try:
-        message = to_openai_message(raw["choices"][0]["message"])
+        message = to_openai_message(
+            raw["choices"][0]["message"], finish_reason=raw["choices"][0].get("finish_reason")
+        )
     except UnrecognizedToolCallFormatError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
