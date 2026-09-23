@@ -80,7 +80,7 @@ def agent_chat(request: AgentChatRequest):
         messages = request.conversation
     elif request.messages is not None:
         new_messages = [m.model_dump() for m in request.messages]
-        history = memory.rolling_window(memory.load_session(request.session_id)) if request.session_id else []
+        history = memory.session_replay(llm, request.session_id) if request.session_id else []
         messages = [
             {"role": "system", "content": build_system_prompt(request.system, request.thinking, request.mode)}
         ] + history + new_messages

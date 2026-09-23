@@ -131,7 +131,7 @@ def chat(request: NativeChatRequest):
         kwargs["tools"] = tools
 
     new_messages = _to_llama_messages(request.messages)
-    history = memory.rolling_window(memory.load_session(request.session_id)) if request.session_id else []
+    history = memory.session_replay(llm, request.session_id) if request.session_id else []
     messages = [
         {"role": "system", "content": build_system_prompt(request.system, request.thinking)}
     ] + history + new_messages

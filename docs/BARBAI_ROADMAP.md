@@ -463,27 +463,45 @@ vars to hand-configure - is its own phase, broken down separately in
   and needs to work on an independent piece without colliding.
 - Not done: no automated tests exist anywhere in the project yet.
 
-### Phase 2.5 — Memory V2 — next up (not started)
-Everything in Phase 2.3 above is v1: a raw JSONL log, a message-count
-rolling window, and explicit-only global facts — "start dumb," on
-purpose. Decided 2026-09-23 to pick this back up as the next real API
-work, rather than moving on to a new feature area. Scope, not yet
-finalized:
-- **Session summarization**, the v2 already flagged as deferred in Phase
-  2.3 above: when `rolling_window`/`fit_to_context` would otherwise drop
-  old turns with no trace, summarize what's being dropped instead of
-  discarding it outright — same "ChatGPT-style cheap extraction vs.
-  Claude-style conversation summarization" distinction called out there.
-  Open question to settle before building: summarize synchronously
-  (inline, when a turn is about to be dropped) or idle-triggered like
-  Mana's approach (section 6 above) — the synchronous version is simpler
-  and has no scheduling to build, the idle version doesn't cost latency
-  on a live request.
-- Whether this shares any machinery with the Phase 2.3 output-truncation
-  bug above — a summarization pass is itself a large generation that
-  needs the same "don't silently truncate" guarantee once that's fixed,
-  so fixing the truncation bug first is worth doing before leaning on
-  summarization for anything load-bearing.
+### Phase 2.5 — Memory V2 — session summarization done, 2026-09-23
+Everything in Phase 2.3 was v1: a raw JSONL log, a message-count rolling
+window, and explicit-only global facts — "start dumb," on purpose. This
+phase picks up the one piece explicitly flagged as deferred there:
+turns that fall out of the replay window are no longer just dropped with
+no trace.
+- **`core/summarization.py`** (new): a small, focused model call
+  (`thinking_mode="fast"` — no reasoning pass needed for this) that folds
+  a batch of turns into a running summary, given the prior summary text
+  (if any). Routed through the normal `fit_to_context`/
+  `create_chat_completion`/`to_openai_message` path, so it inherits the
+  Phase 2.3 truncation-detection fix rather than needing its own - it
+  was built right after that fix specifically so this could lean on it,
+  per the open question the previous version of this section raised.
+- **`core/memory.py::session_replay()`** (new, replaces the direct
+  `rolling_window(load_session(...))` call both `/agent/chat` and
+  `/chat` used before): still keeps the last `ROLLING_WINDOW_MESSAGES`
+  turns verbatim, but folds anything older into a summary instead of
+  dropping it, incrementally — a `summarized_through` counter (persisted
+  in `<session_id>.summary.json` alongside the session log) tracks how
+  much of the log is already represented in the summary, so each call
+  only summarizes the newly-dropped slice, not the whole history again.
+  `rolling_window()` itself is untouched and still used directly (by
+  tests, and as `session_replay()`'s own fallback).
+- **Decided: synchronous, not idle-triggered** - the simpler of the two
+  options this section previously left open. No background scheduler,
+  no separate trigger mechanism to build; the cost is the one extra
+  model call a request pays when the window is actually full, same
+  trade-off the roadmap's "start dumb" bias has made everywhere else.
+- **Toggle:** `BARBAI_SESSION_SUMMARIZATION=off` (default on) - same
+  per-call-checked pattern as `BARBAI_GLOBAL_MEMORY`. Also degrades to
+  the plain v1 drop automatically if a summarization call itself fails
+  (caught in `session_replay()`) - a degraded memory beats a broken
+  conversation.
+- Not done: no idle/background consolidation (still not needed, given
+  the synchronous decision above); the summary is a single running block
+  of prose, not the entity-tagged/cross-session-linked richer shape
+  Mana's memory store does (section 6 above) - revisit only once
+  explicit-only summarization is proven insufficient in practice.
 
 ### Deferred
 Voice (whisper.cpp STT + a TTS provider), avatar, remote messaging
